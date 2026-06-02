@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "best"
+version = "0.1.0"
+description = "Batched Emulator Sampling with Tensorflow"
+readme = "README.md"
+requires-python = ">=3.10"
+
+dependencies = [
+    "numpy>=1.23",
+    "tensorflow>=2.17",
+    "tensorflow-probability>=0.24",
+    "tf-keras>=2.17",
+    "hypersphere-sampler"
+]
+
+authors = [
+    {name = "Andreas Nygaard", email = "Andreas@phys.au.dk"}
+]
+
+license = {file = "LICENSE"}
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
