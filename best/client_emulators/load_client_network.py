@@ -5,11 +5,24 @@ import tensorflow as tf
 import numpy as np
 
 from best.client_emulators.custom_objects import Alsing, CustomTanh, create_msre_loss
+from best.client_emulators import lcdm, sterile_neutrino
+
+model_path = lcdm.path().joinpath("trained_model.keras")
 
 def load_model_and_scalers(emulator_dir, root='best/client_emulators'):
-    model_path = os.path.join(root, emulator_dir, 'trained_model.keras')
-    x_scaler_path = os.path.join(root, emulator_dir, 'x_scaler.pkl')
-    y_scaler_path = os.path.join(root, emulator_dir, 'y_scaler.pkl')
+    emulator_path = os.path.join(root, emulator_dir)
+    if emulator_path == "best/client_emulators/lcdm":
+        model_path = lcdm.path().joinpath("trained_model.keras")
+        x_scaler_path = lcdm.path().joinpath("x_scaler.pkl")
+        y_scaler_path = lcdm.path().joinpath("y_scaler.pkl")
+    elif emulator_path == "best/client_emulators/sterile_neutrino":
+        model_path = sterile_neutrino.path().joinpath("trained_model.keras")
+        x_scaler_path = sterile_neutrino.path().joinpath("x_scaler.pkl")
+        y_scaler_path = sterile_neutrino.path().joinpath("y_scaler.pkl")
+    else:
+        model_path = os.path.join(emulator_path, 'trained_model.keras')
+        x_scaler_path = os.path.join(emulator_path, 'x_scaler.pkl')
+        y_scaler_path = os.path.join(emulator_path, 'y_scaler.pkl')
 
     with open(x_scaler_path, 'rb') as f:
         x_scaler = pkl.load(f)
