@@ -6,7 +6,7 @@ import tensorflow_probability as tfp
 tfd = tfp.distributions
 tf.get_logger().setLevel('ERROR')
 
-from best.tools import LogProbCounter, py_update, trace_fn_w_progress_bar, trace_fn_wo_progress_bar, mh_proposal_fn, MalaWithStepSize, MalaResults, jit_tfp_sample
+from best.tools import LogProbCounter, py_update, mh_proposal_fn, MalaWithStepSize, MalaResults, jit_tfp_sample
 
 
 def custom_formatwarning(msg, *args, **kwargs):
@@ -84,16 +84,11 @@ def run_mh(log_prob_fn,
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
 
-    if progress_bar:
-        trace_fn = trace_fn_w_progress_bar
-    else:
-        trace_fn = trace_fn_wo_progress_bar
-
-    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mh, progress_bar=progress_bar, jit_compile=jit_compile)
+    samples, loglkl, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mh, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
     n_evals = log_prob_counter.num_calls
 
-    return x_samples, acceptance_rate, n_evals
+    return x_samples, loglkl, acceptance_rate, n_evals
 
 
 
@@ -121,7 +116,13 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
             element_shape=tf.TensorShape([2 * n_walkers, n_params]),
         )
 
-        def body(i, state1, state2, logp1, logp2, chain):
+        loglkl = tf.TensorArray(
+            dtype=dtype,
+            size=steps,
+            element_shape=tf.TensorShape([2 * n_walkers]),
+        )
+
+        def body(i, state1, state2, logp1, logp2, chain, loglkl):
 
             # --- same sequential update as before ---
             idx1 = tf.random.uniform([n_walkers], 0, n_walkers, dtype=tf.int32)
@@ -157,6 +158,7 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
             new_logp2 = tf.where(accept2, logp_prop2, logp2)
 
             combined = tf.concat([new_state1, new_state2], axis=0)
+            combined_loglkl = tf.concat([new_logp1, new_logp2], axis=0)
 
             return (
                 i + 1,
@@ -165,16 +167,17 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
                 new_logp1,
                 new_logp2,
                 chain.write(i, combined),
+                loglkl.write(i, combined_loglkl),
             )
 
-        _, state1, state2, logp1, logp2, chain = tf.while_loop(
+        _, state1, state2, logp1, logp2, chain, loglkl = tf.while_loop(
             lambda i, *_: i < steps,
             body,
-            loop_vars=[0, state1, state2, logp1, logp2, chain],
+            loop_vars=[0, state1, state2, logp1, logp2, chain, loglkl],
             parallel_iterations=1,
         )
 
-        return state1, state2, logp1, logp2, chain.stack()
+        return state1, state2, logp1, logp2, chain.stack(), loglkl.stack()
 
     # -------- Python driver with progress bar --------
     total_steps = n_steps + num_burnin_steps
@@ -191,6 +194,7 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
         )
 
     all_chunks = []
+    all_loglkl = []
     steps_done = 0
 
     if progressbar:
@@ -204,11 +208,12 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
     while steps_done < total_steps:
         steps_this = min(chunk_size, total_steps - steps_done)
 
-        state1, state2, logp1, logp2, chunk = run_chunk(
+        state1, state2, logp1, logp2, chunk, loglkl = run_chunk(
             state1, state2, logp1, logp2, steps_this
         )
 
         all_chunks.append(chunk)
+        all_loglkl.append(loglkl)
         steps_done += steps_this
 
         if progressbar:
@@ -221,7 +226,9 @@ def aies_sampling(log_prob, n_steps, current_state, args=(), num_burnin_steps=0,
 
     samples = tf.concat(all_chunks, axis=0)
     samples = samples[num_burnin_steps:]
-    return samples
+    loglkl = tf.concat(all_loglkl, axis=0)
+    loglkl = loglkl[num_burnin_steps:]
+    return samples, loglkl
 
 
 def run_aies(log_prob_fn,
@@ -250,16 +257,16 @@ def run_aies(log_prob_fn,
 
     n_params = initial_state[0].shape[1]
     # run the sampler
-    samples = aies_sampling(log_prob_counter,
-                            n_steps,
-                            initial_state,
-                            args=[],
-                            num_burnin_steps=num_burnin_steps,
-                            progressbar=progress_bar,
-                            jit_compile=jit_compile)
+    samples, loglkl = aies_sampling(log_prob_counter,
+                                    n_steps,
+                                    initial_state,
+                                    args=[],
+                                    num_burnin_steps=num_burnin_steps,
+                                    progressbar=progress_bar,
+                                    jit_compile=jit_compile)
     acceptance_rate = tf.raw_ops.UniqueV2(x=samples, axis=[0])[0].shape[0]/samples.shape[0]
     n_evals = log_prob_counter.num_calls
-    return samples, acceptance_rate, n_evals
+    return samples, loglkl, acceptance_rate, n_evals
 
 
 
@@ -324,15 +331,10 @@ def run_hmc(log_prob_fn,
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
 
-    if progress_bar:
-        trace_fn = trace_fn_w_progress_bar
-    else:
-        trace_fn = trace_fn_wo_progress_bar
-
-    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_hmc, progress_bar=progress_bar, jit_compile=jit_compile)
+    samples, loglkl, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_hmc, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
     n_evals = log_prob_counter.num_calls
-    return x_samples, acceptance_rate, n_evals
+    return x_samples, loglkl, acceptance_rate, n_evals
 
 
 
@@ -398,15 +400,10 @@ def run_nuts(log_prob_fn,
 
     z0 = tf.zeros_like(initial_state, dtype=tf.float32)
 
-    if progress_bar:
-        trace_fn = trace_fn_w_progress_bar
-    else:
-        trace_fn = trace_fn_wo_progress_bar
-
-    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_nuts, progress_bar=progress_bar, jit_compile=jit_compile)
+    samples, loglkl, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_nuts, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
     n_evals = log_prob_counter.num_calls
-    return x_samples, acceptance_rate, n_evals
+    return x_samples, loglkl, acceptance_rate, n_evals
 
 
 
@@ -490,12 +487,7 @@ def run_mala(log_prob_fn,
         step_size_setter_fn=mala_step_size_setter_fn,
     )
 
-    if progress_bar:
-        trace_fn = trace_fn_w_progress_bar
-    else:
-        trace_fn = trace_fn_wo_progress_bar
-
-    samples, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mala, progress_bar=progress_bar, inner_level=2, jit_compile=jit_compile)
+    samples, loglkl, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mala, progress_bar=progress_bar, inner_level=2, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
     n_evals = log_prob_counter.num_calls.numpy()
-    return x_samples, acceptance_rate, n_evals
+    return x_samples, loglkl, acceptance_rate, n_evals

@@ -22,45 +22,49 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
     def run_chunk1(current_state, kernel_results, num_steps):
         states = tf.TensorArray(current_state.dtype, size=num_steps)
         accepts = tf.TensorArray(tf.bool, size=num_steps)
+        loglkl = tf.TensorArray(current_state.dtype, size=num_steps)
 
-        def body(i, state, results, states, accepts):
+        def body(i, state, results, states, accepts, loglkl):
             next_state, next_results = kernel.one_step(state, results)
 
             states = states.write(i, next_state)
             accepts = accepts.write(i, next_results.inner_results.is_accepted)
+            loglkl = loglkl.write(i, next_results.inner_results.accepted_results.target_log_prob)
 
-            return i + 1, next_state, next_results, states, accepts
+            return i + 1, next_state, next_results, states, accepts, loglkl
 
-        _, state, results, states, accepts = tf.while_loop(
+        _, state, results, states, accepts, loglkl = tf.while_loop(
             lambda i, *_: i < num_steps,
-            loop_vars=[0, current_state, kernel_results, states, accepts],
+            loop_vars=[0, current_state, kernel_results, states, accepts, loglkl],
             body=body,
             parallel_iterations=1,
         )
 
-        return state, results, states.stack(), accepts.stack()
+        return state, results, states.stack(), accepts.stack(), loglkl.stack()
 
     @tf.function(jit_compile=jit_compile)
     def run_chunk2(current_state, kernel_results, num_steps):
         states = tf.TensorArray(current_state.dtype, size=num_steps)
         accepts = tf.TensorArray(tf.bool, size=num_steps)
+        loglkl = tf.TensorArray(current_state.dtype, size=num_steps)
 
-        def body(i, state, results, states, accepts):
+        def body(i, state, results, states, accepts, loglkl):
             next_state, next_results = kernel.one_step(state, results)
 
             states = states.write(i, next_state)
             accepts = accepts.write(i, next_results.inner_results.inner_results.is_accepted)
+            loglkl = loglkl.write(i, next_results.inner_results.inner_results.accepted_results.target_log_prob)
 
-            return i + 1, next_state, next_results, states, accepts
+            return i + 1, next_state, next_results, states, accepts, loglkl
 
-        _, state, results, states, accepts = tf.while_loop(
+        _, state, results, states, accepts, loglkl = tf.while_loop(
             lambda i, *_: i < num_steps,
-            loop_vars=[0, current_state, kernel_results, states, accepts],
+            loop_vars=[0, current_state, kernel_results, states, accepts, loglkl],
             body=body,
             parallel_iterations=1,
         )
 
-        return state, results, states.stack(), accepts.stack()
+        return state, results, states.stack(), accepts.stack(), loglkl.stack()
 
     if inner_level == 1:
         run_chunk = run_chunk1
@@ -74,19 +78,20 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
     chunk_remainder = total_steps % chunk_size
 
     # pre-compilation
-    _, res, _, _ = run_chunk(
+    _, res, _, _, _ = run_chunk(
         current_state, kernel_results, chunk_size
     )
-    _, res, _, _ = run_chunk(
+    _, res, _, _, _ = run_chunk(
         current_state, res, chunk_size
     )
     if chunk_remainder > 0:
-        _, res, _, _ = run_chunk(
+        _, res, _, _, _ = run_chunk(
             current_state, res, chunk_remainder
         )
 
     samples_list = []
     accepts_list = []
+    loglkl_list = []
 
     steps_done = 0
 
@@ -100,7 +105,7 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
 
     while steps_done < total_steps:
         steps_this = min(chunk_size, total_steps - steps_done)
-        current_state, kernel_results, chunk_states, accepts = run_chunk(
+        current_state, kernel_results, chunk_states, accepts, loglkl = run_chunk(
             current_state,
             kernel_results,
             steps_this
@@ -108,6 +113,7 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
 
         samples_list.append(chunk_states)
         accepts_list.append(accepts)
+        loglkl_list.append(loglkl)
 
         steps_done += steps_this
 
@@ -125,8 +131,12 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
     accepts = tf.concat(accepts_list, axis=0)
     accepts = accepts[num_burnin_steps:]
 
+    loglkl = tf.concat(loglkl_list, axis=0)
+    loglkl = loglkl[num_burnin_steps:]
+
     acceptance_rate = tf.reduce_mean(tf.cast(accepts, tf.float32))
-    return samples, acceptance_rate
+    return samples, loglkl, acceptance_rate
+
 
 def mh_proposal_fn(state, seed, step_size=0.1):
     flat_state = tf.nest.flatten(state)
@@ -264,8 +274,11 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
     rate_str = " "*diff_rate + rate_str + " it/s"
 
     # --- BAR ---
-    output_size = os.get_terminal_size().columns
-    bar_width = max(output_size - len("".join([percent,counter,elapsed_str,eta_str,rate_str])) - 9, 10)
+    try:
+        output_size = os.get_terminal_size().columns
+        bar_width = max(output_size - len("".join([percent,counter,elapsed_str,eta_str,rate_str])) - 9, 10)
+    except:
+        bar_width = 10
     filled = round(progress * bar_width)
     filled_burnin = round(min(burnin / total, progress) * bar_width)
     filled_sampling = filled - filled_burnin
@@ -290,25 +303,3 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
         sys.stdout.write("\n")
 
     return 0.0
-
-
-def trace_fn_w_progress_bar(_, pkr, num_samples, num_burnin_steps, inner_results, num_steps_between_results=0):
-    tf.py_function(
-        func=lambda step: py_update(step, num_samples, num_burnin_steps, num_steps_between_results),
-        inp=[pkr.step],
-        Tout=tf.float32
-    )
-
-    return (
-        inner_results.is_accepted,
-    )
-
-def trace_fn_wo_progress_bar(_, pkr, num_samples, num_burnin_steps, inner_results, num_steps_between_results=0):
-    if pkr.step > 0:
-        tf.print("Step:", pkr.step, "of", num_samples + num_burnin_steps, " "*8, end="\r")
-    if pkr.step == num_samples + num_burnin_steps - 1:
-        tf.print()
-
-    return (
-        inner_results.is_accepted,
-    )

@@ -8,23 +8,26 @@ from hypersphere_sampler import HypersphereSampler
 from best.mcmc_methods import run_mh, run_aies, run_hmc, run_nuts, run_mala
 
 class SamplerResults():
-    def __init__(self, samples, acceptance_rate, evaluations):
+    def __init__(self, samples, loglkl, acceptance_rate, evaluations):
         self.samples = samples
+        self.loglkl = loglkl
         self.acceptance_rate = acceptance_rate
         self.evaluations = evaluations
         self.burnin_samples = None
+        self.burnin_loglkl = None
         self.burnin_acceptance_rates = None
         self.burnin_evaluations = None
         self.covmat_estimate = None
 
-    def set_burnin_results(self, burnin_samples, burnin_acceptance_rates, burnin_evaluations, covmat_estimate):
+    def set_burnin_results(self, burnin_samples, burnin_loglkl, burnin_acceptance_rates, burnin_evaluations, covmat_estimate):
         self.burnin_samples = burnin_samples
+        self.burnin_loglkl = burnin_loglkl
         self.burnin_acceptance_rates = burnin_acceptance_rates
         self.burnin_evaluations = burnin_evaluations
         self.covmat_estimate = covmat_estimate
 
 class Sampler:
-    def __init__(self, log_prob_fn, bounds=None, enforce_boundaries=True, covmat=None, initial_state=None, n_chains=10, initial_distribution='repeat'):
+    def __init__(self, log_prob_fn, bounds=None, enforce_boundaries=True, covmat=None, initial_state=None, n_chains=10, initial_distribution='repeat', boundary_penalty_factor=10000):
         self.log_prob_no_bounds = log_prob_fn
         if bounds is not None:
             self.lower_bounds = tf.convert_to_tensor(bounds[0], dtype=tf.float32)
@@ -38,7 +41,7 @@ class Sampler:
             self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=(lower_bounds, upper_bounds))
             
         if enforce_boundaries and bounds is not None:
-            self.log_prob_fn = self.create_bounded_log_prob_fn(self.log_prob_no_bounds)
+            self.log_prob_fn = self.create_bounded_log_prob_fn(self.log_prob_no_bounds, penalty_factor=boundary_penalty_factor)
         else:
             self.log_prob_fn = log_prob_fn
 
@@ -124,16 +127,20 @@ class Sampler:
         burnin_sampler_kwargs = sampler_kwargs.copy()
         burnin_sampler_kwargs.update(burnin_kwargs)
         burnin_samples = []
+        burnin_loglkl = []
         burnin_acceptance_rates = []
         burnin_evaluations = []
         for i in range(num_covmat_updates):
             print(f"Estimating covariance matrix, iteration {i+1}/{num_covmat_updates}...")
-            samples, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
+            samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
             combined_samples = tf.reshape(samples, [n_chains * num_burnin_steps, dim])
+            combined_loglkl = tf.reshape(loglkl, [n_chains * num_burnin_steps])
             if get_individual_chains:
                 burnin_samples.append(samples)
+                burnin_loglkl.append(loglkl)
             else:
                 burnin_samples.append(combined_samples)
+                burnin_loglkl.append(combined_loglkl)
             burnin_acceptance_rates.append(acceptance_rate)
             burnin_evaluations.append(evaluations)
             if not continue_distribution:
@@ -158,22 +165,22 @@ class Sampler:
                                        covmat=covmat_estimate)
 
         print("Running final sampling...")
-        samples, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
+        samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
         if not get_individual_chains:
             samples = tf.reshape(samples, [n_chains * n_steps, dim])
 
-        sampler_results = SamplerResults(samples, acceptance_rate, evaluations)
+        sampler_results = SamplerResults(samples, loglkl, acceptance_rate, evaluations)
         if num_covmat_updates > 0:
-            sampler_results.set_burnin_results(burnin_samples, burnin_acceptance_rates, burnin_evaluations, covmat_estimate)
+            sampler_results.set_burnin_results(burnin_samples, burnin_loglkl, burnin_acceptance_rates, burnin_evaluations, covmat_estimate)
 
         return sampler_results
         
 
 
-    def create_bounded_log_prob_fn(self, log_prob_fn):
+    def create_bounded_log_prob_fn(self, log_prob_fn, penalty_factor=10000):
         scales = self.upper_bounds - self.lower_bounds
         def box_log_prob(x):
-            factor = 10000/scales
+            factor = penalty_factor/scales
             below = factor*tf.exp(self.lower_bounds - x)      # penalty if below lower bound
             above = factor*tf.exp(x - self.upper_bounds)      # penalty if above upper bound
             inside = tf.zeros_like(x)                         # inside the box: uniform
