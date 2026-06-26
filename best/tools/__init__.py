@@ -5,6 +5,11 @@ import os
 import sys
 from collections import namedtuple
 
+try:
+    output_size = os.get_terminal_size().columns
+except:
+    output_size = 0
+
 class LogProbCounter:
     def __init__(self, log_prob_fn):
         self.log_prob_fn = log_prob_fn
@@ -274,10 +279,9 @@ def py_update(step, num_samples, num_burnin_steps, num_steps_between_results):
     rate_str = " "*diff_rate + rate_str + " it/s"
 
     # --- BAR ---
-    try:
-        output_size = os.get_terminal_size().columns
+    if output_size > 0:
         bar_width = max(output_size - len("".join([percent,counter,elapsed_str,eta_str,rate_str])) - 9, 10)
-    except:
+    else:
         bar_width = 10
     filled = round(progress * bar_width)
     filled_burnin = round(min(burnin / total, progress) * bar_width)
