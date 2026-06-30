@@ -69,7 +69,8 @@ class Sampler:
                sampler_kwargs={},
                burnin_kwargs={},
                get_individual_chains=True,
-               jit_compile=True):
+               jit_compile=True,
+               temperature=1.0):
 
         if (num_covmat_updates is None or num_covmat_updates > 0) and num_burnin_steps <= 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
@@ -85,11 +86,13 @@ class Sampler:
         n_chains = self.initial_state.shape[0]
         dim = self.initial_state.shape[1]
 
+        log_prob_fn = lambda x: self.log_prob_fn(x) / temperature
+
         if 'jit_compile' not in sampler_kwargs:
             sampler_kwargs.update({'jit_compile': jit_compile})
 
         if method == 'mh':
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mh(self.log_prob_fn,
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mh(log_prob_fn,
                                                                                     initial_state,
                                                                                     n_steps=steps,
                                                                                     covmat=covmat,
@@ -98,24 +101,24 @@ class Sampler:
             continue_distribution = True
             if num_covmat_updates is None:
                 num_covmat_updates = 0
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_aies(self.log_prob_fn,
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_aies(log_prob_fn,
                                                                                       initial_state,
                                                                                       n_steps=steps,
                                                                                       **sampler_kwargs)
         elif method == 'hmc':
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_hmc(self.log_prob_fn,
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_hmc(log_prob_fn,
                                                                                      initial_state,
                                                                                      n_steps=steps,
                                                                                      covmat=covmat,
                                                                                      **sampler_kwargs)
         elif method == 'nuts':
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_nuts(self.log_prob_fn,
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_nuts(log_prob_fn,
                                                                                       initial_state,
                                                                                       n_steps=steps,
                                                                                       covmat=covmat,
                                                                                       **sampler_kwargs)
         elif method == 'mala':
-            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mala(self.log_prob_fn,
+            sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mala(log_prob_fn,
                                                                                       initial_state,
                                                                                       n_steps=steps,
                                                                                       covmat=covmat,
@@ -168,6 +171,7 @@ class Sampler:
         samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
         if not get_individual_chains:
             samples = tf.reshape(samples, [n_chains * n_steps, dim])
+            loglkl = tf.reshape(loglkl, [n_chains * n_steps])
 
         sampler_results = SamplerResults(samples, loglkl, acceptance_rate, evaluations)
         if num_covmat_updates > 0:
