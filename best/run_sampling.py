@@ -70,7 +70,8 @@ class Sampler:
                burnin_kwargs={},
                get_individual_chains=True,
                jit_compile=True,
-               temperature=1.0):
+               temperature=1.0,
+               verbose=True):
 
         if (num_covmat_updates is None or num_covmat_updates > 0) and num_burnin_steps <= 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
@@ -134,7 +135,8 @@ class Sampler:
         burnin_acceptance_rates = []
         burnin_evaluations = []
         for i in range(num_covmat_updates):
-            print(f"Estimating covariance matrix, iteration {i+1}/{num_covmat_updates}...")
+            if verbose:
+                print(f"Estimating covariance matrix, iteration {i+1}/{num_covmat_updates}...")
             samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
             combined_samples = tf.reshape(samples, [n_chains * num_burnin_steps, dim])
             combined_loglkl = tf.reshape(loglkl, [n_chains * num_burnin_steps])
@@ -167,7 +169,8 @@ class Sampler:
                                        bounds=bounds,
                                        covmat=covmat_estimate)
 
-        print("Running final sampling...")
+        if verbose:
+            print("Running final sampling...")
         samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
         if not get_individual_chains:
             samples = tf.reshape(samples, [n_chains * n_steps, dim])
