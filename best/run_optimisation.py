@@ -435,14 +435,14 @@ class Optimiser:
             ax.clear()
             current = result["opt_res"]
             p = current.fixed_points[0].numpy()
-            lkl = current.loglike.numpy()
+            lkl = current.loglkl.numpy()
             ax.plot(p, lkl, 'o-', markersize=8, color='C0')
             ax.set_xlabel(f'Parameter {current.idxs[0]}')
             ax.set_ylabel(r'$-log \mathcal{L}$')
 
             if ci_flag:
                 p = current.fixed_points[0].numpy()
-                lkl = current.loglike.numpy()
+                lkl = current.loglkl.numpy()
                 lkl_min = (
                     lkl_min_global
                     if lkl_min_global is not None
@@ -504,7 +504,7 @@ class Optimiser:
                 axis=1
             ).numpy()[0]
             lkl = tf.concat(
-                [old.loglike, new.loglike],
+                [old.loglkl, new.loglkl],
                 axis=0
             ).numpy()
             reduced_pos = tf.concat(
@@ -519,7 +519,7 @@ class Optimiser:
             
             # append results
             old.fixed_points = tf.constant(tf.stack([p], axis=0), dtype=tf.float32)
-            old.loglike = tf.constant(lkl, dtype=tf.float32)
+            old.loglkl = tf.constant(lkl, dtype=tf.float32)
             old.reduced_position = tf.constant(reduced_pos, dtype=tf.float32)
             old.full_position = tf.constant(full_pos, dtype=tf.float32)
             result["opt_res"] = old
@@ -563,7 +563,7 @@ class Optimiser:
             ax.clear()
             current = result["opt_res"]
             p = current.fixed_points[0].numpy()
-            lkl = current.loglike.numpy()
+            lkl = current.loglkl.numpy()
             ax.plot(p, lkl, 'o-', markersize=8, color='C0')
             # black overlay for selected points
             if len(self.selected_idx) > 0:
@@ -581,7 +581,7 @@ class Optimiser:
 
             if ci_flag:
                 p = current.fixed_points[0].numpy()
-                lkl = current.loglike.numpy()
+                lkl = current.loglkl.numpy()
                 lkl_min = np.min(lkl)
                 self.compute_ci(ax, p, lkl, lkl_min)
 
@@ -647,11 +647,11 @@ class Optimiser:
             )
 
             # convert to numpy for safe elementwise logic
-            old_loglike_np = old.loglike.numpy()
+            old_loglike_np = old.loglkl.numpy()
             old_red_np = old.reduced_position.numpy()
             old_full_np = old.full_position.numpy()
 
-            new_loglike_np = recomputed.loglike.numpy()
+            new_loglike_np = recomputed.loglkl.numpy()
             new_red_np = recomputed.reduced_position.numpy()
             new_full_np = recomputed.full_position.numpy()
 
@@ -673,7 +673,7 @@ class Optimiser:
                 old_red_np[i, :] = new_red_np[j, :]
                 old_full_np[i, :] = new_full_np[j, :]
 
-            old.loglike = tf.constant(old_loglike_np, dtype=old.loglike.dtype)
+            old.loglkl = tf.constant(old_loglike_np, dtype=old.loglkl.dtype)
             old.reduced_position = tf.constant(old_red_np, dtype=old.reduced_position.dtype)
             old.full_position = tf.constant(old_full_np, dtype=old.full_position.dtype)
 
@@ -757,7 +757,7 @@ class Optimiser:
             current = result["opt_res"]
             pi = current.fixed_points[0].numpy()
             pj = current.fixed_points[1].numpy()
-            lkl = current.loglike.numpy()
+            lkl = current.loglkl.numpy()
 
             # clip automatically handled via norm.clip=True
             ax.scatter(
@@ -868,8 +868,8 @@ class Optimiser:
                     [old.fixed_points, new.fixed_points],
                     axis=1
                 )
-                new.loglike = tf.concat(
-                    [old.loglike, new.loglike],
+                new.loglkl = tf.concat(
+                    [old.loglkl, new.loglkl],
                     axis=0
                 )
                 new.reduced_position = tf.concat(
@@ -881,7 +881,7 @@ class Optimiser:
                     axis=0
                 )
                 if lkl_min_global is None:
-                    new_min = tf.reduce_min(new.loglike).numpy()
+                    new_min = tf.reduce_min(new.loglkl).numpy()
                     contour_min["value"] = min(
                         contour_min["value"],
                         new_min
@@ -989,7 +989,7 @@ class Optimiser:
             current = result["opt_res"]
             pi = current.fixed_points[0].numpy()
             pj = current.fixed_points[1].numpy()
-            lkl = current.loglike.numpy()
+            lkl = current.loglkl.numpy()
             ax.scatter(
                 pi,
                 pj,
@@ -1152,11 +1152,11 @@ class Optimiser:
             )
 
             # convert to numpy for safe comparison
-            old_loglike_np = old.loglike.numpy()
+            old_loglike_np = old.loglkl.numpy()
             old_red_np = old.reduced_position.numpy()
             old_full_np = old.full_position.numpy()
 
-            new_loglike_np = recomputed.loglike.numpy()
+            new_loglike_np = recomputed.loglkl.numpy()
             new_red_np = recomputed.reduced_position.numpy()
             new_full_np = recomputed.full_position.numpy()
 
@@ -1171,12 +1171,12 @@ class Optimiser:
                 old_red_np[i, :] = new_red_np[j, :]
                 old_full_np[i, :] = new_full_np[j, :]
 
-            old.loglike = tf.constant(old_loglike_np, dtype=old.loglike.dtype)
+            old.loglkl = tf.constant(old_loglike_np, dtype=old.loglkl.dtype)
             old.reduced_position = tf.constant(old_red_np, dtype=old.reduced_position.dtype)
             old.full_position = tf.constant(old_full_np, dtype=old.full_position.dtype)
 
             if lkl_min_global is None:
-                new_min = tf.reduce_min(old.loglike).numpy()
+                new_min = tf.reduce_min(old.loglkl).numpy()
                 contour_min["value"] = min(
                     contour_min["value"],
                     new_min
