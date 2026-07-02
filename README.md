@@ -273,14 +273,14 @@ It can, however, happen that a few points fail to optimise properly, and this ca
 results = optimiser.compute_profile([0,1])
 optimiser.plot_profile_2d(results)
 ```
-<img width="449" height="382" alt="plot_profile" src="https://github.com/user-attachments/assets/2bab342c-6cff-4729-a678-2fb63c6d6d70" />
+<img width="449" height="382" alt="plot_profile" src="https://private-user-images.githubusercontent.com/61239752/616314594-2bab342c-6cff-4729-a678-2fb63c6d6d70.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODMwMDI3MjYsIm5iZiI6MTc4MzAwMjQyNiwicGF0aCI6Ii82MTIzOTc1Mi82MTYzMTQ1OTQtMmJhYjM0MmMtNmNmZi00NzI5LWE2NzgtMmZiNjNjNmQ2ZDcwLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA3MDIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNzAyVDE0MjcwNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPWZmMzY2YmNiN2FjY2ExYjZmM2RjODYxNmM0ZDhjYjg3MzgyN2JmOTI0MGIyZjA1YzRhYzYyYjlmNmE0MWE4ZjMmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRnBuZyJ9.kifiR91Xpz41PRtNnRU5FQ7g3t1HnDMJgJoszqBHkz0" />
 
 Here, there are three points that stand out (artificially altered for this example), and these can be recomputed using the methods `recompute_points_1d` and `recompute_points_2d`. This will open an interactive version of the plot where points can be selected by clicking them and recomputed using the "Enter" key:
  
 ```python
 updated_results = optimiser.recompute_points_2d(results)
 ```
-<img width="446" height="382" alt="recompute" src="https://github.com/user-attachments/assets/f7ab8fad-2b0f-4e07-a722-49ded1d66d10" />
+<img width="446" height="382" alt="recompute" src="https://private-user-images.githubusercontent.com/61239752/616314619-f7ab8fad-2b0f-4e07-a722-49ded1d66d10.gif?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODMwMDI3MjYsIm5iZiI6MTc4MzAwMjQyNiwicGF0aCI6Ii82MTIzOTc1Mi82MTYzMTQ2MTktZjdhYjhmYWQtMmIwZi00ZTA3LWE3MjItNDlkZWQxZDY2ZDEwLmdpZj9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA3MDIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNzAyVDE0MjcwNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTM4NTVkZGExZjg4ZGNlMzkzMzAzMmU2YzVkMzU1ZDRmNmFlY2M5MmJiMTY3NGU1YTY1N2NmNWQzMWEzMjVmMWQmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRmdpZiJ9.FdPp2hFLLU_a__8pxubsZi5F5jbr7VI7nJRxu91Tugg" />
 
 Even though the automatic point selection worked very well, sometimes a few more points are needed to properly represent the 3-sigma contour well enough. In this case, one can use the methods `add_points_1d` and `add_points_2d`. This will also open an interactive version of the plot where new points can be added by clicking the desired position and computed using the "Enter" key: 
 
@@ -288,11 +288,11 @@ Even though the automatic point selection worked very well, sometimes a few more
 updated_results = optimiser.recompute_points_2d(updated_results)
 ```
 
-<img width="446" height="382" alt="add" src="https://github.com/user-attachments/assets/1462894f-fcc3-4242-834f-5548751d3f34" />
+<img width="446" height="382" alt="add" src="https://private-user-images.githubusercontent.com/61239752/616314623-1462894f-fcc3-4242-834f-5548751d3f34.gif?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODMwMDI3MjYsIm5iZiI6MTc4MzAwMjQyNiwicGF0aCI6Ii82MTIzOTc1Mi82MTYzMTQ2MjMtMTQ2Mjg5NGYtZmNjMy00MjQyLTgzNGYtNTU0ODc1MWQzZjM0LmdpZj9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA3MDIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNzAyVDE0MjcwNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPWVjMzBiOTEyZmE5YTEyNmE3ZTY3ZDU0NWUxOGE5NjM3YmQ0ZGQ5ZGQyNTViZDk2YWNkMmYxNDRjNDNhYjc4ZDImWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRmdpZiJ9.OKpcF1er3HkjsKNRUi_IIiLq-xzmqHO5hjMJmTH9XVA" />
 
 When adding or recomputing points for a 2D profile likelihood, the colour scale can be adjusted using the "up" and "down" arrow keys. This can help better compare adjacent points when the span in likelihood values is quite large:
 
-<img width="446" height="382" alt="color_scale" src="https://github.com/user-attachments/assets/a7106ed0-cb4b-4a90-8355-33a7ed4615e3" />
+<img width="446" height="382" alt="color_scale" src="https://private-user-images.githubusercontent.com/61239752/616314607-a7106ed0-cb4b-4a90-8355-33a7ed4615e3.gif?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODMwMDI3MjYsIm5iZiI6MTc4MzAwMjQyNiwicGF0aCI6Ii82MTIzOTc1Mi82MTYzMTQ2MDctYTcxMDZlZDAtY2I0Yi00YTkwLTgzNTUtMzNhN2VkNDYxNWUzLmdpZj9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA3MDIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNzAyVDE0MjcwNlomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPWQ2MmQ5OTVhMDE1MWE4YWJkZjAxM2ZlMjA3Zjc1MTg5ODM3MWE1NjQ0YTYwZjZjNTQ3NGZiYzRjOGI2Y2Q5NzcmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRmdpZiJ9.Um6T1cRTZ6YK5ugsufBp1mDuO9mI_UMIdZJg5CYlgTQ" />
 
 ## Requirements
  - Python ≥ 3.10
