@@ -1,4 +1,5 @@
 import copy
+from time import time
 import tensorflow as tf
 import tensorflow_probability as tfp
 import numpy as np
@@ -7,6 +8,7 @@ from matplotlib.ticker import MaxNLocator
 from scipy.interpolate import CloughTocher2DInterpolator, CubicSpline
 from scipy.optimize import minimize, brentq
 from best import Sampler
+from best.optimisers import GradientDescent, GradientDescentLineSearch, DiagonalGaussNewton, DiagonalBFGS
 
 class OptimiserResults():
     def __init__(self, vals, min_loglike, min_position, idxs, idx_reduced):
@@ -71,14 +73,24 @@ class Optimiser:
                         points,
                         idxs,
                         batch_size=10,
-                        step_size=0.05,
-                        min_step_size=1e-5,
-                        max_correct_loglike=10000,
                         start_temperature=1.0,
                         min_temperature=1e-2,
                         decay_temperature=0.5,
-                        decay_step_size=0.5,
-                        verbose=True):
+                        verbose=True,
+                        optimiser='diag_gn',
+                        opt_kwargs={},
+                        jit_compile=True):
+        if optimiser == 'gd':
+            optimiser = tf.function(GradientDescent, jit_compile=jit_compile)
+        elif optimiser == 'gd_ls':
+            optimiser = tf.function(GradientDescentLineSearch, jit_compile=jit_compile)
+        elif optimiser == 'diag_gn':
+            optimiser = tf.function(DiagonalGaussNewton, jit_compile=jit_compile)
+        elif optimiser == 'diag_bfgs':
+            optimiser = tf.function(DiagonalBFGS, jit_compile=jit_compile)
+        else:
+            raise ValueError("Invalid optimiser specified. Please choose from 'gd', 'gd_ls', 'diag_gn', or 'diag_bfgs'.")
+
         N_param = self.N_param_tot - len(idxs)
 
         nbins = points.shape[-1]
@@ -93,6 +105,14 @@ class Optimiser:
         lower_reduced = tf.gather(tf.constant(self.lower, dtype=tf.float32), idx_reduced)
         upper_reduced = tf.gather(tf.constant(self.upper, dtype=tf.float32), idx_reduced)
 
+        @tf.function(jit_compile=jit_compile)
+        def loglike(x):
+            return self._loglike(x, vals, idx_reduced, idxs)
+
+        @tf.function(jit_compile=jit_compile)
+        def loglike_grad(x):
+            return tfp.math.value_and_gradient(loglike, x)
+
         cov_reduced = tf.gather(tf.gather(self.covmat, idx_reduced, axis=0), idx_reduced, axis=1)
         tril_reduced = tf.linalg.cholesky(cov_reduced)
         T=start_temperature
@@ -106,13 +126,15 @@ class Optimiser:
             y = tf.stack([prop_dist[i].sample((batch_size)) for i in range(nbins)])
             X = tf.clip_by_value(y, lower_reduced, upper_reduced)
             X = tf.reshape(X, [nbins*batch_size, N_param])
-            position, loglike_val = self.optimise(X, cov_reduced, (lower_reduced, upper_reduced), vals, idx_reduced, idxs, n_steps=100, lr=step_size)
-        
-            while (tf.math.reduce_any(tf.math.is_nan(loglike_val)) or tf.math.reduce_any(loglike_val > max_correct_loglike)) and step_size > min_step_size:
-                if verbose:
-                    print('Bad loglike values found, trying again with lower step size.')
-                step_size *= decay_step_size
-                position, loglike_val = self.optimise(X, cov_reduced, (lower_reduced, upper_reduced), vals, idx_reduced, idxs, n_steps=100, lr=step_size)
+            t0 = time()
+            position, loglike_val = optimiser(loglike,
+                                              loglike_grad,
+                                              X,
+                                              cov_reduced,
+                                              (lower_reduced, upper_reduced),
+                                              **opt_kwargs)
+            t1 = time()
+            print('Optimisation time:', t1-t0, 'seconds')
 
             loglike_mins = tf.reshape(loglike_val, [nbins, batch_size])
             positions = tf.reshape(position, [nbins, batch_size, N_param])
@@ -124,8 +146,7 @@ class Optimiser:
             min_position = tf.tensor_scatter_nd_update(min_position, idx2update[:,None], tf.gather(bestfit, idx2update))
         return min_loglike, min_position
 
-    @tf.function(jit_compile=True)
-    def loglike(self,
+    def _loglike(self,
                 x,
                 vals,
                 idx_reduced,
@@ -140,50 +161,6 @@ class Optimiser:
                  batch_size]))
 
         return self.log_prob_fn(y)
-
-    @tf.function(jit_compile=True)
-    def loglike_grad(self,
-                     x,
-                     vals,
-                     idx_reduced,
-                     idxs):
-        return tfp.math.value_and_gradient(lambda x: self.loglike(x, vals, idx_reduced, idxs), x)
-
-    @tf.function(jit_compile=True)
-    def optimise(self,
-                 x0,
-                 prec,
-                 bounds,
-                 vals,
-                 idx_reduced,
-                 idxs,
-                 n_steps=50,
-                 lr=0.05):
-
-        x = x0
-        val = tf.zeros(
-            tf.shape(x0)[:-1],
-            dtype=x0.dtype
-        )
-
-        def body(i, x, val):
-
-            val, g = self.loglike_grad(x, vals, idx_reduced, idxs)
-
-            step = tf.einsum("...ij,...j->...i", prec, g)
-            x = x - tf.expand_dims(lr, -1) * step
-
-            x = tf.clip_by_value(x, bounds[0], bounds[1])
-
-            return i + 1, x, val
-
-        _, x_final, val_final = tf.while_loop(
-            lambda i, x, val: i < n_steps,
-            body,
-            [0, x0, val]
-        )
-
-        return x_final, val_final
 
     def histogram2d(self,
                     samples,
@@ -259,12 +236,11 @@ class Optimiser:
                         start_temperature=1.0,
                         decay_temperature=0.5,
                         min_temperature=1e-2,
-                        step_size=0.05,
-                        min_step_size=1e-5,
-                        decay_step_size=0.5,
-                        max_correct_loglike=10000,
                         nd_fixed=None,
-                        verbose=True):
+                        optimiser='diag_gn',
+                        opt_kwargs={},
+                        verbose=True,
+                        jit_compile=True):
         if len(idxs) == self.N_param_tot:
             raise ValueError("All parameters are fixed - no optimisation can be performed. Please provide a subset of parameters to optimise over using the 'idxs' argument.")
         if fixed_points is not None and fixed_points.shape[0] == len(idxs):
@@ -284,7 +260,7 @@ class Optimiser:
                 vals = nd_fixed
             else:
                 raise ValueError("Only global optimisation, 1D profiles, and 2D profiles can automatically be computed. For higher dimensions, please provide a set of points to minimise the log-likelihood at using the nd_fixed argument. The shape must be (n, m), where n is the number of fixed parameters (length of 'idxs') and m is the number of points to optimise.")
-        min_loglike, min_position = self.optimise_points(vals, idxs, batch_size=batch_size, step_size=step_size, min_step_size=min_step_size, max_correct_loglike=max_correct_loglike, min_temperature=min_temperature, decay_temperature=decay_temperature, decay_step_size=decay_step_size, start_temperature=start_temperature, verbose=verbose)
+        min_loglike, min_position = self.optimise_points(vals, idxs, batch_size=batch_size, min_temperature=min_temperature, decay_temperature=decay_temperature, start_temperature=start_temperature, verbose=verbose, optimiser=optimiser, opt_kwargs=opt_kwargs, jit_compile=jit_compile)
         opt_res = OptimiserResults(vals, min_loglike, min_position, idxs, tf.constant([i for i in range(len(self.loc)) if i not in idxs], dtype=tf.int32))
         return opt_res
 
@@ -327,19 +303,28 @@ class Optimiser:
                         opt_res,
                         lkl_min_global=None,
                         ax=None,
-                        confidence_intervals=True):
-        if opt_res.fixed_points.shape[0] != 1:
-            raise ValueError("Only 1D profiles can be plotted. Please provide an OptimiserResults object with exactly 1 fixed parameter. For 2D profiles, use the plot_2d_profile method.")
-        p = opt_res.fixed_points[0].numpy()
-        lkl = opt_res.loglkl.numpy()
-        if lkl_min_global is None:
-            lkl_min_global = tf.reduce_min(opt_res.loglkl)
+                        confidence_intervals=False):
+        #if opt_res.fixed_points.shape[0] != 1:
+        #    raise ValueError("Only 1D profiles can be plotted. Please provide an OptimiserResults object with exactly 1 fixed parameter. For 2D profiles, use the plot_2d_profile method.")
+        if type(opt_res) != list:
+            opt_res = [opt_res]
         if ax is None:
             fig = plt.figure()
             ax = fig.add_subplot(111)
 
-        ax.plot(p, lkl, 'o-', markersize=8, color='C0')
-        ax.set_xlabel(f'Parameter {opt_res.idxs[0]}')
+        for i, res in enumerate(opt_res):
+            if i == 0:
+                idx = res.idxs[0]
+            idx_i = res.idxs[0]
+            if idx_i != idx:
+                continue
+            p = res.fixed_points[0].numpy()
+            lkl = res.loglkl.numpy()
+            if lkl_min_global is None:
+                lkl_min_global = tf.reduce_min(res.loglkl)
+
+            ax.plot(p, lkl, 'o-', markersize=8)#, color='C0')
+        ax.set_xlabel(f'Parameter {opt_res[0].idxs[0]}')
         ax.set_ylabel(r'$-log \mathcal{L}$')
         if confidence_intervals:
             self.compute_ci(ax, p, lkl, lkl_min_global)
@@ -353,6 +338,9 @@ class Optimiser:
                    lkl_min_global):
 
         p, lkl = zip(*sorted(zip(p, lkl)))
+        # if a point is repeated, remove it (this can happen if the user adds a point that is already in the profile)
+        p = np.array(p)
+        
 
         spline = CubicSpline(p, lkl, bc_type='natural')
 
@@ -413,10 +401,12 @@ class Optimiser:
                       start_temperature=1.0,
                       decay_temperature=0.5,
                       min_temperature=1e-2,
-                      step_size=0.05,
-                      min_step_size=1e-5,
-                      decay_step_size=0.5,
-                      max_correct_loglike=10000):
+                      optimiser='diag_gn',
+                      opt_kwargs={},
+                      verbose=True,
+                      jit_compile=True):
+                      
+
 
         self.new_points = []
         result = {
@@ -439,6 +429,9 @@ class Optimiser:
             ax.plot(p, lkl, 'o-', markersize=8, color='C0')
             ax.set_xlabel(f'Parameter {current.idxs[0]}')
             ax.set_ylabel(r'$-log \mathcal{L}$')
+            ax.set_title(
+                "Click to add points - Enter to optimise"
+            )
 
             if ci_flag:
                 p = current.fixed_points[0].numpy()
@@ -490,13 +483,13 @@ class Optimiser:
                 idxs=old.idxs,
                 fixed_points=fixed,
                 batch_size=batch_size,
-                step_size=step_size,
-                min_step_size=min_step_size,
-                max_correct_loglike=max_correct_loglike,
                 min_temperature=min_temperature,
                 decay_temperature=decay_temperature,
-                decay_step_size=decay_step_size,
-                start_temperature=start_temperature
+                start_temperature=start_temperature,
+                optimiser=optimiser,
+                opt_kwargs=opt_kwargs,
+                verbose=verbose,
+                jit_compile=jit_compile
             )
             # sort results py parameter value
             p = tf.concat(
@@ -546,10 +539,10 @@ class Optimiser:
                             start_temperature=1.0,
                             decay_temperature=0.5,
                             min_temperature=1e-2,
-                            step_size=0.05,
-                            min_step_size=1e-5,
-                            decay_step_size=0.5,
-                            max_correct_loglike=10000):
+                            optimiser='diag_gn',
+                            opt_kwargs={},
+                            verbose=True,
+                            jit_compile=True):
 
         self.selected_idx = set()
         result = {
@@ -578,6 +571,9 @@ class Optimiser:
 
             ax.set_xlabel(f'Parameter {current.idxs[0]}')
             ax.set_ylabel(r'$-log \mathcal{L}$')
+            ax.set_title(
+                "Click to select points - Enter to recompute"
+            )
 
             if ci_flag:
                 p = current.fixed_points[0].numpy()
@@ -637,13 +633,13 @@ class Optimiser:
                 idxs=old.idxs,
                 fixed_points=fixed,
                 batch_size=batch_size,
-                step_size=step_size,
-                min_step_size=min_step_size,
-                max_correct_loglike=max_correct_loglike,
                 min_temperature=min_temperature,
                 decay_temperature=decay_temperature,
-                decay_step_size=decay_step_size,
-                start_temperature=start_temperature
+                start_temperature=start_temperature,
+                optimiser=optimiser,
+                opt_kwargs=opt_kwargs,
+                verbose=verbose,
+                jit_compile=jit_compile
             )
 
             # convert to numpy for safe elementwise logic
@@ -701,10 +697,10 @@ class Optimiser:
                       start_temperature=1.0,
                       decay_temperature=0.5,
                       min_temperature=1e-2,
-                      step_size=0.05,
-                      min_step_size=1e-5,
-                      decay_step_size=0.5,
-                      max_correct_loglike=10000):
+                      optimiser='diag_gn',
+                      opt_kwargs={},
+                      verbose=True,
+                      jit_compile=True):
 
         self.new_points = []
         result = {
@@ -795,7 +791,7 @@ class Optimiser:
             ax.set_xlabel(f"Parameter {current.idxs[0]}")
             ax.set_ylabel(f"Parameter {current.idxs[1]}")
             ax.set_title(
-                "Click to add points - Enter = optimise - ↑↓ adjust color scale"
+                "Click to add points - Enter to optimise - ↑↓ adjust color scale"
             )
             ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
             ax.yaxis.set_major_locator(MaxNLocator(nbins=6))
@@ -855,13 +851,14 @@ class Optimiser:
                 new = self.compute_profile(
                     idxs=old.idxs,
                     fixed_points=new_points,
-                    step_size=step_size,
-                    min_step_size=min_step_size,
-                    max_correct_loglike=max_correct_loglike,
+                    batch_size=batch_size,
                     min_temperature=min_temperature,
                     decay_temperature=decay_temperature,
-                    decay_step_size=decay_step_size,
-                    start_temperature=start_temperature
+                    start_temperature=start_temperature,
+                    optimiser=optimiser,
+                    opt_kwargs=opt_kwargs,
+                    verbose=verbose,
+                    jit_compile=jit_compile
                 )
                 # merge results
                 new.fixed_points = tf.concat(
@@ -933,10 +930,10 @@ class Optimiser:
                             start_temperature=1.0,
                             decay_temperature=0.5,
                             min_temperature=1e-2,
-                            step_size=0.05,
-                            min_step_size=1e-5,
-                            decay_step_size=0.5,
-                            max_correct_loglike=10000):
+                            optimiser='diag_gn',
+                            opt_kwargs={},
+                            verbose=True,
+                            jit_compile=True):
 
         self.selected_idx = set()
         result = {
@@ -1142,13 +1139,14 @@ class Optimiser:
             recomputed = self.compute_profile(
                 idxs=old.idxs,
                 fixed_points=selected_fixed,
-                step_size=step_size,
-                min_step_size=min_step_size,
-                max_correct_loglike=max_correct_loglike,
+                batch_size=batch_size,
                 min_temperature=min_temperature,
                 decay_temperature=decay_temperature,
-                decay_step_size=decay_step_size,
-                start_temperature=start_temperature
+                start_temperature=start_temperature,
+                optimiser=optimiser,
+                opt_kwargs=opt_kwargs,
+                verbose=verbose,
+                jit_compile=jit_compile
             )
 
             # convert to numpy for safe comparison

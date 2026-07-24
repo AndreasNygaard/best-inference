@@ -188,9 +188,9 @@ class Sampler:
         scales = self.upper_bounds - self.lower_bounds
         def box_log_prob(x):
             factor = penalty_factor/scales
-            below = factor*tf.exp(self.lower_bounds - x)      # penalty if below lower bound
-            above = factor*tf.exp(x - self.upper_bounds)      # penalty if above upper bound
-            inside = tf.zeros_like(x)                         # inside the box: uniform
+            below = factor*(tf.exp(self.lower_bounds - x) - 1.0)      # penalty if below lower bound
+            above = factor*(tf.exp(x - self.upper_bounds) - 1.0)      # penalty if above upper bound
+            inside = tf.zeros_like(x)                                 # inside the box: uniform
             log_prob = tf.where(x < self.lower_bounds, -below,
                                 tf.where(x > self.upper_bounds, -above, inside))
             return tf.reduce_sum(log_prob, axis=-1)
