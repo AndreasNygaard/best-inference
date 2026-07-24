@@ -1,6 +1,5 @@
 from best import NestedSampler
 import tensorflow as tf
-import tensorflow_probability as tfp
 import numpy as np
 
 def log_prob(x):
@@ -17,18 +16,25 @@ def log_prob(x):
 
 d = 3
 
-ns = NestedSampler(
-    log_prob,
-    ([-5]*d, [5]*d),
-    1000,
-    n_live_updates=10
-)
-    
-results = ns.run(verbose=True, update_interval=10, display_param_idx=0)
+if 'GPU' in [x.device_type for x in tf.config.list_physical_devices()]:
+    device = '/GPU:0'
+    print('Using GPU')
+else:
+    device = '/CPU:0'
 
-print('Target logZ:',
-      np.log(
-          np.exp(np.log(2) + d/2*np.log(2*np.pi)-d*np.log(10)) +
-          np.exp(d/2*np.log(2*np.pi/0.5)-d*np.log(10))
-      )
-)
+with tf.device(device):
+    ns = NestedSampler(
+        log_prob,
+        ([-5]*d, [5]*d),
+        1000,
+        n_live_updates=10,
+    )
+    
+    results = ns.run(verbose=True, update_interval=10, display_param_idx=0)
+
+    print('Target logZ:',
+          np.log(
+              np.exp(np.log(2) + d/2*np.log(2*np.pi)-d*np.log(10)) +
+              np.exp(d/2*np.log(2*np.pi/0.5)-d*np.log(10))
+          )
+    )

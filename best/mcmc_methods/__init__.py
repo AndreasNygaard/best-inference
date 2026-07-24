@@ -487,7 +487,7 @@ def run_mala(log_prob_fn,
         step_size_setter_fn=mala_step_size_setter_fn,
     )
 
-    samples, loglkl, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mala, progress_bar=progress_bar, inner_level=2, jit_compile=jit_compile)
+    samples, loglkl, acceptance_rate = jit_tfp_sample(n_steps, num_burnin_steps, z0, adaptive_mala, progress_bar=progress_bar, jit_compile=jit_compile)
     x_samples = initial_state + tf.linalg.matmul(samples, L, transpose_b=True)
     n_evals = log_prob_counter.num_calls.numpy()
     return x_samples, loglkl, acceptance_rate, n_evals

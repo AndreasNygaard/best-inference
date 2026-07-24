@@ -70,6 +70,7 @@ class Sampler:
                burnin_kwargs={},
                get_individual_chains=True,
                jit_compile=True,
+               progress_bar=True,
                temperature=1.0,
                verbose=True):
 
@@ -91,6 +92,8 @@ class Sampler:
 
         if 'jit_compile' not in sampler_kwargs:
             sampler_kwargs.update({'jit_compile': jit_compile})
+        if 'progress_bar' not in sampler_kwargs:
+            sampler_kwargs.update({'progress_bar': progress_bar})
 
         if method == 'mh':
             sample_fn = lambda initial_state, steps, covmat, sampler_kwargs: run_mh(log_prob_fn,

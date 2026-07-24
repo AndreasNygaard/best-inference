@@ -22,11 +22,33 @@ class LogProbCounter:
         return self.log_prob_fn(*args)
 
 
-def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_bar=True, inner_level=1, jit_compile=True):
+def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_bar=True, jit_compile=True):
     kernel_results = kernel.bootstrap_results(current_state)
 
+    def get_target_log_prob(results):
+        if hasattr(results, "accepted_results"):
+            return results.accepted_results.target_log_prob
+        elif hasattr(results, "target_log_prob"):
+            return results.target_log_prob
+        elif hasattr(results, "inner_results"):
+            return get_target_log_prob(results.inner_results)
+        else:
+            raise ValueError(f"Cannot find target_log_prob in {type(results)}")
+
+    def get_acceptance(results):
+        if hasattr(results, "is_accepted"):
+            return results.is_accepted
+
+        if hasattr(results, "log_accept_ratio"):
+            return tf.exp(tf.minimum(0., results.log_accept_ratio)) > 0.5
+
+        if hasattr(results, "inner_results"):
+            return get_acceptance(results.inner_results)
+
+        raise ValueError(f"Cannot find acceptance in {type(results)}")
+
     @tf.function(jit_compile=jit_compile)
-    def run_chunk1(current_state, kernel_results, num_steps):
+    def run_chunk(current_state, kernel_results, num_steps):
         states = tf.TensorArray(current_state.dtype, size=num_steps)
         accepts = tf.TensorArray(tf.bool, size=num_steps)
         loglkl = tf.TensorArray(current_state.dtype, size=num_steps)
@@ -35,8 +57,8 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
             next_state, next_results = kernel.one_step(state, results)
 
             states = states.write(i, next_state)
-            accepts = accepts.write(i, next_results.inner_results.is_accepted)
-            loglkl = loglkl.write(i, next_results.inner_results.accepted_results.target_log_prob)
+            accepts = accepts.write(i, get_acceptance(next_results))
+            loglkl = loglkl.write(i, get_target_log_prob(next_results))
 
             return i + 1, next_state, next_results, states, accepts, loglkl
 
@@ -48,37 +70,6 @@ def jit_tfp_sample(n_steps, num_burnin_steps, current_state, kernel, progress_ba
         )
 
         return state, results, states.stack(), accepts.stack(), loglkl.stack()
-
-    @tf.function(jit_compile=jit_compile)
-    def run_chunk2(current_state, kernel_results, num_steps):
-        states = tf.TensorArray(current_state.dtype, size=num_steps)
-        accepts = tf.TensorArray(tf.bool, size=num_steps)
-        loglkl = tf.TensorArray(current_state.dtype, size=num_steps)
-
-        def body(i, state, results, states, accepts, loglkl):
-            next_state, next_results = kernel.one_step(state, results)
-
-            states = states.write(i, next_state)
-            accepts = accepts.write(i, next_results.inner_results.inner_results.is_accepted)
-            loglkl = loglkl.write(i, next_results.inner_results.inner_results.accepted_results.target_log_prob)
-
-            return i + 1, next_state, next_results, states, accepts, loglkl
-
-        _, state, results, states, accepts, loglkl = tf.while_loop(
-            lambda i, *_: i < num_steps,
-            loop_vars=[0, current_state, kernel_results, states, accepts, loglkl],
-            body=body,
-            parallel_iterations=1,
-        )
-
-        return state, results, states.stack(), accepts.stack(), loglkl.stack()
-
-    if inner_level == 1:
-        run_chunk = run_chunk1
-    elif inner_level == 2:
-        run_chunk = run_chunk2
-    else:
-        raise NotImplementedError("Using more than 2 nested kernels is not supported.")
 
     total_steps = n_steps + num_burnin_steps
     chunk_size = min(max(1, total_steps // 100), 1000)

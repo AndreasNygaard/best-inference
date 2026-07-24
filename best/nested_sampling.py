@@ -664,12 +664,17 @@ class NestedSampler:
     @tf.function
     def compute_diagnostics(self, state, lower, upper, dim_idx=0, bins=50):
         live_points = self.scale_fn_inv(state[0])
+        #max_distance = tf.reduce_max(
+        #    tf.norm(
+        #        live_points[:, None, :] - live_points[None, :, :],
+        #        axis=-1
+        #    )
+        #) # scales very badly
+        center = tf.reduce_mean(live_points, axis=0)
         max_distance = tf.reduce_max(
-            tf.norm(
-                live_points[:, None, :] - live_points[None, :, :],
-                axis=-1
-            )
-        )
+            tf.norm(live_points - center, axis=1)
+        ) # scales better, though approximate
+
         live_logL = state[1]
         max_logL = tf.reduce_max(live_logL)
         min_logL = tf.reduce_min(live_logL)
