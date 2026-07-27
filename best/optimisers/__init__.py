@@ -2,6 +2,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 import numpy as np
 
+
 def GradientDescent(loglike,
                     loglike_grad,
                     x0,
@@ -34,6 +35,7 @@ def GradientDescent(loglike,
     )
 
     return x_final, val_final
+
 
 def GradientDescentLineSearch(loglike,
                               loglike_grad,
@@ -119,7 +121,8 @@ def GradientDescentLineSearch(loglike,
 
     return x_final, val_final
 
-def DiagonalBFGS(loglike,
+
+def DiagonalDFP(loglike,
                     loglike_grad,
                     x0,
                     prec,
@@ -152,7 +155,7 @@ def DiagonalBFGS(loglike,
         s = x_new - x
         y = g_new - g
 
-        # ---- Diagonal BFGS update ----
+        # ---- Diagonal DFP update ----
 
         sty = tf.reduce_sum(s * y, axis=-1, keepdims=True)
 
@@ -193,6 +196,85 @@ def DiagonalBFGS(loglike,
 
     return x_final, val_final
 
+
+def DiagonalBFGS(loglike,
+                    loglike_grad,
+                    x0,
+                    prec,
+                    bounds,
+                    n_steps=50,
+                    lr=0.1,
+                    damping=1e-8,
+                    momentum=0.8):
+
+    x = x0
+    v = tf.zeros_like(x)
+
+    # Initial inverse Hessian approximation
+    H = tf.ones_like(x0) * tf.linalg.diag_part(prec)
+
+    val, g = loglike_grad(x)
+
+    def body(i, x, g, val, v, H):
+
+        # Search direction
+        p = -H * g
+
+        v = momentum * v + (1.0 - momentum) * p
+
+        x_new = x + lr * v
+        x_new = tf.clip_by_value(x_new, bounds[0], bounds[1])
+
+        val_new, g_new = loglike_grad(x_new)
+
+        s = x_new - x
+        y = g_new - g
+
+        # ---- Diagonal BFGS update ----
+
+        sty = tf.reduce_sum(s * y, axis=-1, keepdims=True)
+        sty = tf.maximum(sty, damping)
+
+        rho = 1.0 / sty
+
+        Hy = H * y
+        yHy = tf.reduce_sum(y * Hy, axis=-1, keepdims=True)
+
+        H = (
+            H
+            - 2.0 * rho * H * s * y
+            + (rho * rho) * yHy * tf.square(s)
+            + rho * tf.square(s)
+        )
+
+        # Keep inverse Hessian positive
+        H = tf.maximum(H, damping)
+
+        return (
+            i + 1,
+            x_new,
+            g_new,
+            val_new,
+            v,
+            H
+        )
+
+    _, x_final, g_final, val_final, _, H = tf.while_loop(
+        lambda i, *_: i < n_steps,
+        body,
+        [
+            0,
+            x,
+            g,
+            val,
+            v,
+            H
+        ]
+    )
+
+    return x_final, val_final
+
+
 def DiagonalGaussNewton(loglike,
                         loglike_grad,
                         x0,
@@ -208,25 +290,24 @@ def DiagonalGaussNewton(loglike,
 
     # running curvature estimate (diagonal Hessian proxy)
     P_diag = tf.linalg.diag_part(prec)
-    #h_diag = tf.ones_like(x0)
-    h_diag = tf.divide(tf.ones_like(x0), P_diag)  # initial curvature estimate
+    gn_diag = tf.divide(tf.ones_like(x0), P_diag)  # initial curvature estimate
 
     beta = 0.8  # curvature EMA
 
-    def body(i, x, v, h_diag):
+    def body(i, x, v, gn_diag):
 
         val, g = loglike_grad(x)
 
         # ---- Gauss-Newton diagonal proxy ----
         # update curvature estimate from gradient magnitude
-        new_h = tf.square(g)
+        empirical_gn_diag = tf.square(g)
 
-        h_diag = beta * h_diag + (1.0 - beta) * new_h
+        gn_diag = beta * gn_diag + (1.0 - beta) * empirical_gn_diag
 
-        h_eff = h_diag * (1.0 + damping)
+        gn_diag_damped = gn_diag * (1.0 + damping)
 
         # Newton-like step
-        p = -g / h_eff
+        p = -g / gn_diag_damped
 
         # optional momentum (usually 0 in tails, but harmless if small)
         v = momentum * v + (1.0 - momentum) * p
@@ -236,12 +317,12 @@ def DiagonalGaussNewton(loglike,
         # bounds
         x = tf.clip_by_value(x, bounds[0], bounds[1])
 
-        return i + 1, x, v, h_diag
+        return i + 1, x, v, gn_diag
 
     _, x_final, _, _ = tf.while_loop(
-        lambda i, x, v, h: i < n_steps,
+        lambda i, x, v, gn: i < n_steps,
         body,
-        [0, x, v, h_diag]
+        [0, x, v, gn_diag]
     )
 
     val_final = loglike(x_final)

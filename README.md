@@ -2,15 +2,15 @@
 
 (**B**atched **E**mulator **S**ampling with **T**ensorFlow)
 
-A TensorFlow-based inference framework for high-performance Markov Chain Monte Carlo (MCMC) sampling and profile likelihood optimisation, including support for neural likelihood emulators and adaptive covariance estimation.
+A TensorFlow-based inference framework for high-performance Markov Chain Monte Carlo (MCMC) sampling, profile likelihood optimisation,  and nested sampling, including support for neural likelihood emulators, adaptive covariance estimation, and GPU acceleration.
 
 ---
 
 ## Overview
 
-`best` provides a unified interface for sampling using multiple MCMC algorithms with GPU acceleration via TensorFlow. It also features an optimisation module for computing profile likelihoods with an arbitrary number of fixed parameters.
+`best` is a TensorFlow-based inference framework designed for modern accelerator hardware. All algorithms are implemented using vectorized TensorFlow operations and can be JIT compiled with XLA, enabling efficient execution on GPUs for Bayesian posterior sampling, Bayesian evidence estimation, and profile likelihood optimisation.
 
-### Supported mcmc samplers
+### Supported MCMC samplers
 
 - Metropolis-Hastings (MH)
 - Affine Invariant Ensemble Sampler (AIES)
@@ -20,13 +20,15 @@ A TensorFlow-based inference framework for high-performance Markov Chain Monte C
 
 ### Key features
 
-- TensorFlow / GPU acceleration
-- Automatic covariance matrix adaptation
-- Bounded parameter inference
-- Parallelised multi-chain sampling
-- parallelised optimisation of profile likelihoods
+- End-to-end TensorFlow implementation
+- GPU and XLA compatible throughout
+- Batched execution across chains, optimisations and nested-sampling updates
+- Automatic covariance estimation during burn-in
+- Automatic clustering for multimodal nested sampling
+- Covariance-adapted slice sampling
+- Posterior reconstruction from weighted dead points
+- Neural likelihood emulator support
 - Pretrained neural likelihood emulators
-- JIT compilation (XLA support)
 
 ---
 
@@ -88,6 +90,25 @@ print(results.full_position.shape)
 print(results.loglkl.shape)
 ```
 
+### Nested sampling
+
+```python
+import best
+import tensorflow as tf
+import numpy as np
+
+def log_prob(x):
+    return -0.5 * tf.reduce_sum(x**2, axis=-1)
+
+d=3
+n_live = 1000
+nested_sampler = best.NestedSampler(log_prob, bounds=([-5]*d, [5]*d), n_live=n_live)
+
+results = nested_sampler.run()
+print('Target logZ   :', d/2*np.log(2*np.pi)-d*np.log(10))
+print('Computed logZ :', results.logZ.numpy(), '±', results.sigma_logZ.numpy())
+```
+
 ---
 ## Sampler API
 
@@ -112,6 +133,23 @@ optimiser = best.Optimiser(
     covmat=None,
     loc=None,
     mcmc_temperature=1.0
+)
+```
+```python
+nested_sampler = best.NestedSampler(
+    log_prob_fn,
+    bounds,
+    n_live
+    n_live_updates=10,
+    n_max_iter=100000,
+    max_tree_depth=3,
+    min_cluster_size=50,
+    cluster_merge_tolerance=0.30,
+    cluster_update_interval=100,
+    slice_factor=5,
+    slice_step_size=5.0,
+    seed=42,
+    dtype=tf.float32
 )
 ```
 
@@ -150,11 +188,21 @@ results_opt = optimiser.compute_profile(
     start_temperature=1.0,
     decay_temperature=0.5,
     min_temperature=1e-2,
-    step_size=0.05,
-    min_step_size=1e-5,
-    decay_step_size=0.5,
-    max_correct_loglike=10000,
     nd_fixed=None,
+    optimiser="diag_gn" | "diag_bfgs" | "diag_dfp" | "gd" | "gd_ls",
+    opt_kwargs={},
+    verbose=True,
+    jit_compile=True
+)
+```
+
+### Nested sampling
+
+```python
+results_ns = nested_sampler.run(
+    update_interval=10,
+    display_param_idx=0,
+    output_width=None,
     verbose=True
 )
 ```
@@ -179,6 +227,20 @@ results_opt.loglkl
 results_opt.reduced_position
 results_opt.full_position
 results_opt.idxs
+```
+```python
+results_ns.logZ
+results_ns.sigma_logZ
+results_ns.logX
+results_ns.KLDivergence
+results_ns.n_live
+results_ns.live_points
+results_ns.live_logL
+results_ns.dead_points
+results_ns.dead_logL
+results_ns.dead_logX
+results_ns.log_posterior_weights
+results_ns.posterior_weights
 ```
 
 ## Client emulators
@@ -234,6 +296,21 @@ results = optimiser.compute_profile(
 )
 ```
 
+### Example: emulator-based nested sampling
+
+```
+import best
+from best.client_emulators import load_model_and_scalers
+
+log_prob_fn, lower, upper = load_model_and_scalers("lcdm")
+
+nested_sampler = best.NestedSampler(log_prob_fn, bounds=(lower, upper), n_live=5000, n_live_updates=500)
+
+# It takes a few minutes to compile. Run on GPU for faster results
+results = nested_sampler.run(update_interval=10)
+```
+
+
 ## Supported MCMC algorithms
 ### Metropolis-Hastings (MH)
 Random-walk MCMC with optional adaptive covariance scaling.
@@ -246,12 +323,31 @@ Adaptive HMC variant with automatic trajectory length selection.
 ### Metropolis Adjusted Langevin Algorithm (MALA)
 Gradient-informed diffusion-based sampler.
 
+## Supported optimisation algorithms
+### Gradient Descent (GD)
+Preconditioned first-order optimisation with fixed learning rate.
+### Gradient Descent with Line Search (GD-LS)
+Preconditioned first-order optimisation with Armijo backtracking line search.
+### Diagonal Davidon–Fletcher–Powell (Diag-DFP)
+Diagonal quasi-Newton optimisation using the DFP inverse-Hessian update.
+### Diagonal Broyden–Fletcher–Goldfarb–Shanno (Diag-BFGS)
+Diagonal quasi-Newton optimisation using the BFGS inverse-Hessian update.
+### Diagonal Gauss-Newton (Diag-GN)
+Approximate diagonal Gauss–Newton optimisation with online curvature estimation from squared gradients.
+
+## Nested sampling algorithm
+`best` implements a recursive cluster-aware nested sampler using covariance-adapted slice sampling. Live points are recursively partitioned into local clusters, each represented by an independently estimated covariance matrix. Constrained proposals are generated by slice sampling along random directions transformed by the local covariance, allowing efficient exploration of highly anisotropic and multimodal posteriors. Multiple live points are replaced simultaneously, making the algorithm naturally suited for batched GPU execution. Parameters are internally transformed to a common scaled prior space for improved numerical stability. The transformation is applied consistently to the likelihood evaluation and prior volume calculation, leaving Bayesian evidences invariant.
+
+ - Posterior expectations can be computed directly from the weighted dead points without requiring additional MCMC sampling.
+ - results.sigma_logZ is the standard nested-sampling estimate of the uncertainty on logZ.
+
 ## Performance notes
- - TensorFlow enables GPU acceleration where available
- - JIT compilation (XLA) improves performance for large chains
- - Vectorized multi-chain execution is used throughout
- - Covariance estimation is performed during burn-in when enabled
- - Optimiser for profile likelihoods is initialised with an MCMC for exploring the parameter space
+ - GPU acceleration is available for MCMC, optimisation and nested sampling through TensorFlow/XLA.
+ - JIT compilation (XLA) improves performance for large chains.
+ - Batched execution exploits thousands of simultaneous likelihood evaluations on modern GPUs.
+ - Covariance estimation is performed during burn-in when enabled.
+ - Optimiser for profile likelihoods is initialised with an MCMC for exploring the parameter space.
+ - Nested sampler updates multiple live points simultaneously.
 
 ## Example: Multi-sampler comparison
 
@@ -273,14 +369,14 @@ It can, however, happen that a few points fail to optimise properly, and this ca
 results = optimiser.compute_profile([0,1])
 optimiser.plot_profile_2d(results)
 ```
-<img width="449" height="382" alt="plot_profile" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/plot_profile.png" />
+<img width="600" alt="plot_profile" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/plot_profile.png" />
 
 Here, there are three points that stand out (artificially altered for this example), and these can be recomputed using the methods `recompute_points_1d` and `recompute_points_2d`. This will open an interactive version of the plot where points can be selected by clicking them and recomputed using the "Enter" key:
  
 ```python
 updated_results = optimiser.recompute_points_2d(results)
 ```
-<img width="446" height="382" alt="recompute" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/recompute.gif" />
+<img width="600" alt="recompute" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/recompute.gif" />
 
 Even though the automatic point selection worked very well, sometimes a few more points are needed to properly represent the 3-sigma contour well enough. In this case, one can use the methods `add_points_1d` and `add_points_2d`. This will also open an interactive version of the plot where new points can be added by clicking the desired position and computed using the "Enter" key: 
 
@@ -288,11 +384,38 @@ Even though the automatic point selection worked very well, sometimes a few more
 updated_results = optimiser.recompute_points_2d(updated_results)
 ```
 
-<img width="446" height="382" alt="add" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/add.gif" />
+<img width="600" alt="add" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/add.gif" />
 
 When adding or recomputing points for a 2D profile likelihood, the colour scale can be adjusted using the "up" and "down" arrow keys. This can help better compare adjacent points when the span in likelihood values is quite large:
 
-<img width="446" height="382" alt="color_scale" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/color_scale.gif" />
+<img width="600" alt="color_scale" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/color_scale.gif" />
+
+## Nested sampling progress display
+
+When running the nested sampling sampler, a dynamic progress display is shown by default (disable with `verbose=False`). An example is shown below:
+
+<img width="600" alt="nested" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/nested1.gif" />
+
+The display provides a real-time overview of the sampling progress and contains:
+
+- A representation of the current live-point cloud size relative to its initial size
+- A histogram of the current live points along a selected parameter dimension (chosen with the `display_param_idx` keyword argument)
+- Current estimates of:
+  - log-evidence (`logZ`)
+  - estimated uncertainty on the log-evidence
+  - remaining possible log-evidence contribution (`logZ_remain`)
+  - log prior volume fraction (`logX`)
+  - maximum log-likelihood among live points
+  - spread in log-likelihood values among live points
+  - number of detected clusters
+
+The sampler terminates automatically when the evidence estimate has converged and is no longer changing significantly. The remaining evidence estimate is shown as an additional diagnostic of the unconstrained contribution from the remaining live points.
+
+For multimodal likelihoods, the evolution of the live-point distribution can be monitored using the histogram display. For example:
+
+<img width="600" alt="nested_multimodal" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/nested2.gif" />
+
+The clustering and live-point diagnostics are intended to provide insight into the behaviour of the sampler, including mode separation, contraction of the live-point cloud, and convergence towards the final evidence estimate.
 
 ## Requirements
  - Python ≥ 3.10

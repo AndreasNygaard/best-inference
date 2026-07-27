@@ -8,7 +8,7 @@ from matplotlib.ticker import MaxNLocator
 from scipy.interpolate import CloughTocher2DInterpolator, CubicSpline
 from scipy.optimize import minimize, brentq
 from best import Sampler
-from best.optimisers import GradientDescent, GradientDescentLineSearch, DiagonalGaussNewton, DiagonalBFGS
+from best.optimisers import GradientDescent, GradientDescentLineSearch, DiagonalGaussNewton, DiagonalBFGS, DiagonalDFP
 
 class OptimiserResults():
     def __init__(self, vals, min_loglike, min_position, idxs, idx_reduced):
@@ -88,8 +88,10 @@ class Optimiser:
             optimiser = tf.function(DiagonalGaussNewton, jit_compile=jit_compile)
         elif optimiser == 'diag_bfgs':
             optimiser = tf.function(DiagonalBFGS, jit_compile=jit_compile)
+        elif optimiser == 'diag_dfp':
+            optimiser = tf.function(DiagonalDFP, jit_compile=jit_compile)
         else:
-            raise ValueError("Invalid optimiser specified. Please choose from 'gd', 'gd_ls', 'diag_gn', or 'diag_bfgs'.")
+            raise ValueError("Invalid optimiser specified. Please choose from 'gd', 'gd_ls', 'diag_gn', 'diag_dfp', or 'diag_bfgs'.")
 
         N_param = self.N_param_tot - len(idxs)
 
