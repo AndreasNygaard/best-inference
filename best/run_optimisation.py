@@ -8,7 +8,7 @@ from matplotlib.ticker import MaxNLocator
 from scipy.interpolate import CloughTocher2DInterpolator, CubicSpline
 from scipy.optimize import minimize, brentq
 from best import Sampler
-from best.optimisers import GradientDescent, GradientDescentLineSearch, DiagonalGaussNewton, DiagonalBFGS, DiagonalDFP
+from best.optimisers import GradientDescent, GradientDescentLineSearch, DiagonalGaussNewton, DiagonalLevenbergMarquardt, DiagonalBFGS, DiagonalDFP, BFGS
 
 class OptimiserResults():
     def __init__(self, vals, min_loglike, min_position, idxs, idx_reduced):
@@ -77,7 +77,7 @@ class Optimiser:
                         min_temperature=1e-2,
                         decay_temperature=0.5,
                         verbose=True,
-                        optimiser='diag_gn',
+                        optimiser='diag_lm',
                         opt_kwargs={},
                         jit_compile=True):
         if optimiser == 'gd':
@@ -86,12 +86,16 @@ class Optimiser:
             optimiser = tf.function(GradientDescentLineSearch, jit_compile=jit_compile)
         elif optimiser == 'diag_gn':
             optimiser = tf.function(DiagonalGaussNewton, jit_compile=jit_compile)
+        elif optimiser == 'diag_lm':
+            optimiser = tf.function(DiagonalLevenbergMarquardt, jit_compile=jit_compile)
         elif optimiser == 'diag_bfgs':
             optimiser = tf.function(DiagonalBFGS, jit_compile=jit_compile)
         elif optimiser == 'diag_dfp':
             optimiser = tf.function(DiagonalDFP, jit_compile=jit_compile)
+        elif optimiser == 'bfgs':
+            optimiser = tf.function(BFGS, jit_compile=jit_compile)
         else:
-            raise ValueError("Invalid optimiser specified. Please choose from 'gd', 'gd_ls', 'diag_gn', 'diag_dfp', or 'diag_bfgs'.")
+            raise ValueError("Invalid optimiser specified. Please choose from 'gd', 'gd_ls', 'diag_gn', 'diag_lm', 'diag_dfp', 'diag_bfgs', or 'bfgs'.")
 
         N_param = self.N_param_tot - len(idxs)
 
@@ -340,7 +344,6 @@ class Optimiser:
                    lkl_min_global):
 
         p, lkl = zip(*sorted(zip(p, lkl)))
-        # if a point is repeated, remove it (this can happen if the user adds a point that is already in the profile)
         p = np.array(p)
         
 
@@ -461,6 +464,8 @@ class Optimiser:
                 return
             if event.xdata is None:
                 return
+            if event.xdata in self.new_points:
+                return
             self.new_points.append(event.xdata)
             redraw()
 
@@ -511,7 +516,12 @@ class Optimiser:
                 axis=0
             ).numpy()
             p, lkl, reduced_pos, full_pos = zip(*sorted(zip(p, lkl, reduced_pos, full_pos)))
-            
+
+            p, unique_indices = np.unique(p, return_index=True)
+            lkl = np.array(lkl)[unique_indices]
+            reduced_pos = np.array(reduced_pos)[unique_indices]
+            full_pos = np.array(full_pos)[unique_indices]
+
             # append results
             old.fixed_points = tf.constant(tf.stack([p], axis=0), dtype=tf.float32)
             old.loglkl = tf.constant(lkl, dtype=tf.float32)
@@ -811,6 +821,8 @@ class Optimiser:
                 return
             if event.xdata is None or event.ydata is None:
                 return
+            if (event.xdata, event.ydata) in self.new_points:
+                return
             self.new_points.append((event.xdata, event.ydata))
             pts = np.array(self.new_points).T
             marker["obj"].set_data(pts[0], pts[1])
@@ -863,22 +875,33 @@ class Optimiser:
                     jit_compile=jit_compile
                 )
                 # merge results
-                new.fixed_points = tf.concat(
+                p = tf.concat(
                     [old.fixed_points, new.fixed_points],
                     axis=1
-                )
-                new.loglkl = tf.concat(
+                ).numpy()
+                lkl = tf.concat(
                     [old.loglkl, new.loglkl],
                     axis=0
-                )
-                new.reduced_position = tf.concat(
+                ).numpy()
+                reduced_position = tf.concat(
                     [old.reduced_position, new.reduced_position],
                     axis=0
-                )
-                new.full_position = tf.concat(
+                ).numpy()
+                full_position = tf.concat(
                     [old.full_position, new.full_position],
                     axis=0
-                )
+                ).numpy()
+
+                p, unique_indices = np.unique(p, return_index=True, axis=1)
+                lkl = np.array(lkl)[unique_indices]
+                reduced_position = np.array(reduced_position)[unique_indices]
+                full_position = np.array(full_position)[unique_indices]
+
+                new.fixed_points = tf.constant(p, dtype=tf.float32)
+                new.loglkl = tf.constant(lkl, dtype=tf.float32)
+                new.reduced_position = tf.constant(reduced_position, dtype=tf.float32)
+                new.full_position = tf.constant(full_position, dtype=tf.float32)
+
                 if lkl_min_global is None:
                     new_min = tf.reduce_min(new.loglkl).numpy()
                     contour_min["value"] = min(

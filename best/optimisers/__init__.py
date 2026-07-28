@@ -123,14 +123,14 @@ def GradientDescentLineSearch(loglike,
 
 
 def DiagonalDFP(loglike,
-                    loglike_grad,
-                    x0,
-                    prec,
-                    bounds,
-                    n_steps=50,
-                    lr=0.1,
-                    damping=1e-8,
-                    momentum=0.8):
+                loglike_grad,
+                x0,
+                prec,
+                bounds,
+                n_steps=50,
+                lr=0.1,
+                damping=1e-8,
+                momentum=0.8):
 
     x = x0
     v = tf.zeros_like(x)
@@ -198,14 +198,14 @@ def DiagonalDFP(loglike,
 
 
 def DiagonalBFGS(loglike,
-                    loglike_grad,
-                    x0,
-                    prec,
-                    bounds,
-                    n_steps=50,
-                    lr=0.1,
-                    damping=1e-8,
-                    momentum=0.8):
+                 loglike_grad,
+                 x0,
+                 prec,
+                 bounds,
+                 n_steps=50,
+                 lr=0.1,
+                 damping=1e-8,
+                 momentum=0.8):
 
     x = x0
     v = tf.zeros_like(x)
@@ -301,6 +301,7 @@ def DiagonalGaussNewton(loglike,
         # ---- Gauss-Newton diagonal proxy ----
         # update curvature estimate from gradient magnitude
         empirical_gn_diag = tf.square(g)
+        empirical_gn_diag = tf.maximum(empirical_gn_diag, damping)  # avoid zero curvature
 
         gn_diag = beta * gn_diag + (1.0 - beta) * empirical_gn_diag
 
@@ -326,5 +327,199 @@ def DiagonalGaussNewton(loglike,
     )
 
     val_final = loglike(x_final)
+
+    return x_final, val_final
+
+
+def DiagonalLevenbergMarquardt(loglike,
+                               loglike_grad,
+                               x0,
+                               prec,
+                               bounds,
+                               n_steps=50,
+                               lr=0.05,
+                               damping=1e-3,
+                               momentum=0.8):
+
+    x = x0
+    v = tf.zeros_like(x0)
+
+    # running curvature estimate (diagonal Hessian proxy)
+    P_diag = tf.linalg.diag_part(prec)
+    gn_diag = tf.divide(tf.ones_like(x0), P_diag)  # initial curvature estimate
+
+    beta = 0.8  # curvature EMA
+
+    def body(i, x, v, gn_diag):
+
+        val, g = loglike_grad(x)
+
+        # ---- Gauss-Newton diagonal proxy ----
+        # update curvature estimate from gradient magnitude
+        empirical_gn_diag = tf.square(g)
+        empirical_gn_diag = tf.maximum(empirical_gn_diag, damping)  # avoid zero curvature
+
+        gn_diag = beta * gn_diag + (1.0 - beta) * empirical_gn_diag
+
+        gn_diag_damped = gn_diag + damping
+
+        # Newton-like step with Levenberg-Marquardt damping
+        p = -g / gn_diag_damped
+
+        # optional momentum (usually 0 in tails, but harmless if small)
+        v = momentum * v + (1.0 - momentum) * p
+
+        x = x + lr * v
+
+        # bounds
+        x = tf.clip_by_value(x, bounds[0], bounds[1])
+
+        return i + 1, x, v, gn_diag
+
+    _, x_final, _, _ = tf.while_loop(
+        lambda i, x, v, gn: i < n_steps,
+        body,
+        [0, x, v, gn_diag]
+    )
+
+    val_final = loglike(x_final)
+
+    return x_final, val_final
+
+
+def BFGS(loglike,
+         loglike_grad,
+         x0,
+         prec,
+         bounds,
+         n_steps=200,
+         lr=1.0,
+         damping=1e-8,
+         prec_shrink=1e-3,
+         GD_steps=5):
+
+    x = x0
+
+    val, g = loglike_grad(x)
+
+    batch_shape = tf.shape(x0)[:-1]
+    n_param = x0.shape[-1]
+
+    # Batched inverse Hessian initialization
+    H = tf.broadcast_to(
+        prec_shrink * prec,
+        tf.concat(
+            [batch_shape, [n_param, n_param]],
+            axis=0
+        )
+    )
+
+    def body(i, x, g, val, H):
+
+        # Search direction
+        p = -tf.einsum(
+            "...ij,...j->...i",
+            H,
+            g
+        )
+
+        # Step
+        x_new = x + lr * p
+
+        # Boundary projection
+        x_new = tf.clip_by_value(
+            x_new,
+            bounds[0],
+            bounds[1]
+        )
+
+        val_new, g_new = loglike_grad(x_new)
+
+        # Secant quantities
+        s = x_new - x
+        y = g_new - g
+
+        sty = tf.reduce_sum(
+            s*y,
+            axis=-1
+        )
+
+        valid = sty > damping
+
+        rho = tf.where(
+            valid,
+            1.0 / sty,
+            tf.zeros_like(sty)
+        )
+
+        s_col = s[..., :, None]
+        y_col = y[..., :, None]
+
+        syT = tf.matmul(
+            s_col,
+            y_col,
+            transpose_b=True
+        )
+
+        ysT = tf.matmul(
+            y_col,
+            s_col,
+            transpose_b=True
+        )
+
+        ssT = tf.matmul(
+            s_col,
+            s_col,
+            transpose_b=True
+        )
+
+        I = tf.eye(
+            n_param,
+            batch_shape=batch_shape,
+            dtype=x.dtype
+        )
+
+        rho = rho[..., None, None]
+
+        A = I - rho * syT
+
+        H_new = tf.cond(
+            tf.greater(i, GD_steps),
+            lambda: (
+                tf.matmul(
+                    A,
+                    tf.matmul(H, tf.transpose(A, perm=[0,2,1]))
+                )
+                +
+                rho * ssT
+            ),
+            lambda: H
+        )
+
+        H = tf.where(
+            valid[...,None,None],
+            H_new,
+            H
+        )
+
+        return (
+            i+1,
+            x_new,
+            g_new,
+            val_new,
+            H
+        )
+
+    _, x_final, _, val_final, _ = tf.while_loop(
+        lambda i,*_: i < n_steps,
+        body,
+        [
+            0,
+            x,
+            g,
+            val,
+            H
+        ]
+    )
 
     return x_final, val_final
