@@ -938,12 +938,15 @@ class AdaptiveClusterTree:
 
 
 class slice_sampler:
-    def __init__(self, loglike, bounds, n_iter=10, max_expand=20, max_shrink=100):
+    def __init__(self, loglike, bounds, n_iter=10, max_expand=20, max_shrink=100, buffer_size=100, expand_to_worst=False):
         self.loglike = loglike
         self.lower, self.upper = bounds
         self.n_iter = n_iter
         self.max_expand = max_expand
         self.max_shrink = max_shrink
+        self.buffer_size = buffer_size
+        self.expand_to_worst = expand_to_worst
+        self.expand_to_worst_tf = tf.convert_to_tensor(expand_to_worst, dtype=tf.bool)
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def sample(
@@ -955,19 +958,25 @@ class slice_sampler:
     ):
 
         dtype = x0s.dtype
-        #n_updates = tf.shape(x0s)[0]
-        #ndim = tf.shape(x0s)[1]
         n_updates = x0s.shape[0]
         ndim      = x0s.shape[1]
+        buffer_points = tf.zeros((self.buffer_size, n_updates, ndim), dtype=dtype)
+        buffer_logL   = tf.ones((self.buffer_size, n_updates), dtype=dtype)*(-dtype.max)
+
+        expand_compare_logLs = tf.cond(
+            self.expand_to_worst_tf,
+            lambda: tf.ones_like(worst_logLs) * worst_logLs[0],
+            lambda: worst_logLs
+        )
 
         # =====================================================
         # outer slice iterations
         # =====================================================
 
-        def outer_cond(i, x0s):
+        def outer_cond(i, x0s, buffer_points, buffer_logL):
             return i < self.n_iter
 
-        def outer_body(i, x0s):
+        def outer_body(i, x0s, buffer_points, buffer_logL):
 
             # -------------------------------------------------
             # random direction
@@ -1029,21 +1038,26 @@ class slice_sampler:
             inside_a = inside_prior(x_a)
             inside_b = inside_prior(x_b)
 
-            logL_a = self.loglike(x_a)
-            logL_b = self.loglike(x_b)
+            logL = self.loglike(tf.concat([x_a, x_b], axis=0))
+            logL_a = logL[:n_updates]
+            logL_b = logL[n_updates:]
 
             grow_a = tf.cast(
-                tf.logical_and(
-                    logL_a > worst_logLs,
-                    inside_a,
+                tf.logical_not(
+                    tf.logical_or(
+                        logL_a < expand_compare_logLs,
+                        tf.logical_not(inside_a),
+                    )
                 ),
                 dtype,
             )[:, None]
 
             grow_b = tf.cast(
-                tf.logical_and(
-                    logL_b > worst_logLs,
-                    inside_b,
+                tf.logical_not(
+                    tf.logical_or(
+                        logL_b < expand_compare_logLs,
+                        tf.logical_not(inside_b),
+                    )
                 ),
                 dtype,
             )[:, None]
@@ -1075,27 +1089,32 @@ class slice_sampler:
                 a_new = a + a * grow_a
                 b_new = b + b * grow_b
 
-                xa = x(a_new)
-                xb = x(b_new)
+                x_a = x(a_new)
+                x_b = x(b_new)
 
-                inside_a = inside_prior(xa)
-                inside_b = inside_prior(xb)
+                inside_a = inside_prior(x_a)
+                inside_b = inside_prior(x_b)
 
-                logL_a = self.loglike(xa)
-                logL_b = self.loglike(xb)
+                logL = self.loglike(tf.concat([x_a, x_b], axis=0))
+                logL_a = logL[:n_updates]
+                logL_b = logL[n_updates:]
 
                 grow_a = tf.cast(
-                    tf.logical_and(
-                        logL_a > worst_logLs,
-                        inside_a,
+                    tf.logical_not(
+                        tf.logical_and(
+                            logL_a < expand_compare_logLs,
+                            tf.logical_not(inside_a),
+                        )
                     ),
                     dtype,
                 )[:, None]
 
                 grow_b = tf.cast(
-                    tf.logical_and(
-                        logL_b > worst_logLs,
-                        inside_b,
+                    tf.logical_not(
+                        tf.logical_and(
+                            logL_b < expand_compare_logLs,
+                            tf.logical_not(inside_b),
+                        )
                     ),
                     dtype,
                 )[:, None]
@@ -1164,6 +1183,8 @@ class slice_sampler:
                 b,
                 accepted,
                 t_final,
+                buffer_points,
+                buffer_logL,
             ):
 
                 return tf.logical_and(
@@ -1179,6 +1200,8 @@ class slice_sampler:
                 b,
                 accepted,
                 t_final,
+                buffer_points,
+                buffer_logL,
             ):
 
                 seed3 = seed + tf.stack([i+k+1, tf.range(n_updates)[0]+1])
@@ -1268,15 +1291,41 @@ class slice_sampler:
                     * t
                 )
 
+                def save_shrink_history():
+                    # update buffer on index k mod buffer_size
+                    update_index = tf.math.floormod(k, self.buffer_size)
+                    new_points = x_t
+                    new_logL = logL_t
+                    buffer_points_new = tf.tensor_scatter_nd_update(
+                        buffer_points,
+                        tf.reshape(update_index, (1, 1)),
+                        tf.reshape(new_points, (1, n_updates, ndim))
+                    )
+                    buffer_logL_new = tf.tensor_scatter_nd_update(
+                        buffer_logL,
+                        tf.reshape(update_index, (1, 1)),
+                        tf.reshape(new_logL, (1, n_updates))
+                    )
+                    return buffer_points_new, buffer_logL_new
+
+
+                buffer_points, buffer_logL = tf.cond(
+                    tf.equal(i, self.n_iter-1),
+                    save_shrink_history,
+                    lambda: (buffer_points, buffer_logL)
+                )
+
                 return (
                     k + 1,
                     a,
                     b,
                     accepted,
                     t_final,
+                    buffer_points,
+                    buffer_logL
                 )
 
-            _, _, _, _, t_final = tf.while_loop(
+            _, _, _, _, t_final, buffer_points, buffer_logL = tf.while_loop(
                 shrink_cond,
                 shrink_body,
                 (
@@ -1285,6 +1334,8 @@ class slice_sampler:
                     b,
                     accepted,
                     t_final,
+                    buffer_points,
+                    buffer_logL
                 ),
             )
 
@@ -1293,18 +1344,22 @@ class slice_sampler:
             return (
                 i + 1,
                 x0s,
+                buffer_points,
+                buffer_logL
             )
 
-        _, x0s = tf.while_loop(
+        _, x0s, buffer_points, buffer_logL = tf.while_loop(
             outer_cond,
             outer_body,
             (
                 tf.constant(0),
                 x0s,
+                buffer_points,
+                buffer_logL
             ),
         )
 
-        return x0s
+        return x0s, buffer_points, buffer_logL
 
 
 

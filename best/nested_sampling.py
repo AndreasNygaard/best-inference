@@ -50,6 +50,9 @@ class NestedSampler:
         cluster_update_interval=100,
         slice_factor=5,
         slice_step_size=5.0,
+        tolerance=1e-2,
+        batch_sorting=True,
+        history_correction=False,
         seed=42,
         dtype=tf.float32
     ):
@@ -72,6 +75,10 @@ class NestedSampler:
 
         self.slice_factor = int(slice_factor)
         self.slice_step_size = float(slice_step_size)
+
+        self.tolerance = float(tolerance)
+        self.batch_sorting = bool(batch_sorting)
+        self.history_correction = bool(history_correction)
         self.seed = tf.constant([seed, seed+1], dtype=tf.int32)
 
         # --------------------------------------------------
@@ -155,12 +162,22 @@ class NestedSampler:
             self.dtype,
         )
 
+        self.logZ_remaining = tf.constant(
+            0.0,
+            self.dtype,
+        )
+
         self.logX = tf.constant(
             0.0,
             self.dtype,
         )
 
         self.H = tf.constant(
+            0.0,
+            self.dtype,
+        )
+
+        self.HZ = tf.constant(
             0.0,
             self.dtype,
         )
@@ -188,6 +205,7 @@ class NestedSampler:
             loglike=self.log_prob_fn_scaled,
             bounds=(self.scale_fn(self.lower), self.scale_fn(self.upper)),
             n_iter=self.slice_factor*self.ndim,
+            expand_to_worst=False,
         )
 
     def log_prob_fn_scaled(self, y):
@@ -211,6 +229,7 @@ class NestedSampler:
         logZ,
         logX,
         dead_logLs,
+        HZ
     ):
 
         k = tf.shape(dead_logLs)[0]
@@ -250,16 +269,28 @@ class NestedSampler:
 
         new_logX = logXs[-1]
 
+        # Accumulate sum(z_i log L_i)
+        HZ = HZ + tf.reduce_sum(
+            tf.exp(log_contribs) * dead_logLs
+        )
+
+        H = HZ / tf.exp(new_logZ) - new_logZ
+
+
         return (
             new_logZ,
             new_logX,
+            HZ,
+            H
         )
 
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def run_iteration(
         self,
-        state
+        state,
+        batch_sorting=tf.constant(True, dtype=tf.bool),
+        replace_history=tf.constant(False, dtype=tf.bool),
     ):
 
         (
@@ -277,6 +308,7 @@ class NestedSampler:
             nodes_indices,
             nodes_volumes,
             nodes_chols,
+            HZ
         ) = state
 
 
@@ -540,10 +572,225 @@ class NestedSampler:
 
         Ls = tf.gather(nodes_chols, cluster_ids, axis=0)
         
-        new_points = self.slice_sampler.sample(x0s, Ls, worst_logLs, seed=self.seed + tf.stack([iteration, iteration]))
+        new_points, buffer_points, buffer_logLs = self.slice_sampler.sample(x0s, Ls, worst_logLs, seed=self.seed + tf.stack([iteration, iteration]))
         new_logLs = self.log_prob_fn_scaled(new_points)
 
 
+        def no_sorting_fn():
+            return worst_logLs, new_logLs, worst_points, new_points, tf.zeros((2*self.n_live_updates,), dtype=tf.int32)
+
+        def batch_sorting_fn():
+            combined_points = tf.concat(
+                [worst_points, new_points],
+                axis=0,
+            )
+            combined_logLs = tf.concat(
+                [worst_logLs, new_logLs],
+                axis=0,
+            )
+
+            # sort based on combined_logLs
+            combined_logLs, sorted_indices = tf.nn.top_k(-combined_logLs, k=2*self.n_live_updates)
+            combined_points = tf.gather(combined_points, sorted_indices)
+
+            new_dead_points = combined_points[:self.n_live_updates]
+            new_dead_logLs = -combined_logLs[:self.n_live_updates]
+            new_live_points = combined_points[self.n_live_updates:]
+            new_live_logLs = -combined_logLs[self.n_live_updates:]
+            return new_dead_logLs, new_live_logLs, new_dead_points, new_live_points, sorted_indices
+
+        new_dead_logLs, new_live_logLs, new_dead_points, new_live_points, sorted_indices = tf.cond(
+            batch_sorting,
+            batch_sorting_fn,
+            no_sorting_fn
+        )
+
+        def only_sort_once_fn():
+            return new_dead_logLs, new_live_logLs, new_dead_points, new_live_points
+
+        def replace_history_fn():
+            combined_seed_logLs = tf.concat(
+                [-self.dtype.max * tf.ones_like(worst_logLs), worst_logLs],
+                axis=0
+            )
+            combined_seed_logLs = tf.gather(combined_seed_logLs, sorted_indices)
+            new_dead_seed_logLs = combined_seed_logLs[:self.n_live_updates]
+            new_live_seed_logLs = combined_seed_logLs[self.n_live_updates:]
+
+            invalid = new_live_seed_logLs >= new_live_logLs[0]
+
+            relaxed = new_dead_seed_logLs > -self.dtype.max
+
+            invalid_id = tf.cumsum(tf.cast(invalid, tf.int32), exclusive=True)
+
+            invalid_id = tf.where(
+                invalid,
+                invalid_id,
+                tf.fill([self.n_live_updates], -1)
+            )
+
+            relaxed_id = tf.cumsum(tf.cast(relaxed, tf.int32), exclusive=True)
+
+            relaxed_id = tf.where(
+                relaxed,
+                relaxed_id,
+                tf.fill([self.n_live_updates], -1)
+            )
+
+            ids = tf.range(self.n_live_updates)
+
+            threshold_lookup = tf.reduce_max(
+                tf.where(
+                    ids[:, None] == relaxed_id[None, :],
+                    new_dead_logLs[None, :],
+                    tf.fill([self.n_live_updates, self.n_live_updates], -self.dtype.max),
+                ),
+                axis=1,
+            )
+
+            safe_invalid_id = tf.maximum(invalid_id,0)
+
+            replacement_thresholds = tf.gather(
+                threshold_lookup,
+                safe_invalid_id
+            )
+
+            replacement_thresholds = tf.where(
+                invalid,
+                replacement_thresholds,
+                tf.fill([self.n_live_updates], self.dtype.max)
+            )
+
+            seed_match = (
+                new_live_seed_logLs[:,None]
+                == worst_logLs[None,:]
+            )
+
+            buffer_indices = tf.argmax(
+                tf.cast(seed_match,tf.int32),
+                axis=1,
+                output_type=tf.int32
+            )
+
+            history_logLs = tf.gather(
+                buffer_logLs,
+                buffer_indices,
+                axis=1
+            )
+
+            history_logLs = tf.where(
+                invalid[None,:],
+                history_logLs,
+                -self.dtype.max
+            )
+
+            history_points = tf.gather(
+                buffer_points,
+                buffer_indices,
+                axis=1
+            )
+
+            history_points = tf.where(
+                invalid[:,None],
+                history_points,
+                tf.ones_like(history_points)*(-self.dtype.max)
+            )
+
+            above = history_logLs > replacement_thresholds[None,:]
+
+            prev = tf.concat(
+                [tf.zeros_like(above[:1]), above[:-1]],
+                axis=0,
+            )
+
+            first = tf.math.logical_and(
+                above,
+                tf.logical_not(prev)
+            )
+
+            history_idx = tf.argmax(
+                tf.cast(first, tf.int32),
+                axis=0,
+                output_type=tf.int32,
+            )
+
+            cols = tf.range(self.n_live_updates, dtype=tf.int32)
+
+            idx = tf.stack([history_idx, cols], axis=1)
+
+            history_logLs_selected = tf.gather_nd(
+                history_logLs,
+                idx,
+            )
+
+            history_points_selected = tf.gather_nd(
+                history_points,
+                idx,
+            )
+
+            history_found = tf.reduce_any(first, axis=0)
+
+            history_logLs_selected = tf.where(
+                history_found,
+                history_logLs_selected,
+                tf.fill([self.n_live_updates], self.dtype.max),
+            )
+
+            history_points_selected = tf.where(
+                history_found[:,None],
+                history_points_selected,
+                tf.ones_like(history_points_selected)*(-self.dtype.max),
+            )
+
+            actual_new_logLs = tf.where(
+                invalid,
+                history_logLs_selected,
+                new_live_logLs,
+            )
+
+            actual_new_points = tf.where(
+                invalid[:,None],
+                history_points_selected,
+                new_live_points,
+            )
+
+            combined_logLs = tf.concat(
+                [new_dead_logLs, actual_new_logLs],
+                axis=0,
+            )
+
+            combined_points = tf.concat(
+                [new_dead_points, actual_new_points],
+                axis=0,
+            )
+
+            order = tf.argsort(
+                combined_logLs,
+                direction="ASCENDING",
+                stable=True,
+            )
+
+            combined_logLs = tf.gather(combined_logLs, order)
+            combined_points = tf.gather(combined_points, order)
+
+            actual_worst_logLs = combined_logLs[:self.n_live_updates]
+            actual_new_logLs = combined_logLs[self.n_live_updates:]
+
+            actual_worst_points = combined_points[:self.n_live_updates]
+            actual_new_points = combined_points[self.n_live_updates:]
+
+            return actual_worst_logLs, actual_new_logLs, actual_worst_points, actual_new_points
+
+
+        actual_worst_logLs, actual_new_logLs, actual_worst_points, actual_new_points = tf.cond(
+            tf.logical_and(
+                replace_history,
+                batch_sorting
+            ),
+            replace_history_fn,
+            only_sort_once_fn
+        )
+        
         # --------------------------------------------------
         # Store dead point
         # --------------------------------------------------
@@ -557,13 +804,30 @@ class NestedSampler:
         dead_points = tf.tensor_scatter_nd_update(
             dead_points,
             rows[:,None],
-            worst_points,
+            actual_worst_points,
         )
 
         dead_logL = tf.tensor_scatter_nd_update(
             dead_logL,
             rows[:,None],
-            worst_logLs,
+            actual_worst_logLs,
+        )
+
+
+        # --------------------------------------------------
+        # Replace live point
+        # --------------------------------------------------
+
+        live_points = tf.tensor_scatter_nd_update(
+            live_points,
+            worst_indices[:,None],
+            actual_new_points,
+        )
+
+        live_logL = tf.tensor_scatter_nd_update(
+            live_logL,
+            worst_indices[:,None],
+            actual_new_logLs,
         )
 
 
@@ -571,10 +835,11 @@ class NestedSampler:
         # Evidence update
         # --------------------------------------------------
 
-        logZ, logX = self.update_evidence(
+        logZ, logX, HZ, H = self.update_evidence(
             logZ,
             logX,
-            worst_logLs
+            actual_worst_logLs,
+            HZ
         )
 
         logZ_remaining = (
@@ -610,39 +875,7 @@ class NestedSampler:
         )
 
 
-        # --------------------------------------------------
-        # Replace live point
-        # --------------------------------------------------
-
-        live_points = tf.tensor_scatter_nd_update(
-            live_points,
-            worst_indices[:,None],
-            new_points,
-        )
-
-        live_logL = tf.tensor_scatter_nd_update(
-            live_logL,
-            worst_indices[:,None],
-            new_logLs,
-        )
-
-
         iteration = iteration + self.n_live_updates
-
-        n_dead = tf.shape(dead_logL)[0]
-        valid = tf.range(n_dead) < iteration
-        valid_f = tf.cast(valid, self.dtype)
-        posterior_weights = self.compute_posterior_weights(dead_logL, dead_logX, logZ)[1]
-        posterior_weights = tf.where(tf.math.is_nan(posterior_weights), tf.zeros_like(posterior_weights), posterior_weights)
-        posterior_weights *= valid_f
-        posterior_weights /= tf.reduce_sum(posterior_weights)
-        H = tf.reduce_sum(
-            posterior_weights * tf.where(
-                tf.math.is_finite(dead_logL),
-                dead_logL,
-                tf.zeros_like(dead_logL)
-            )
-        ) - logZ
 
         return (
             live_points,
@@ -659,6 +892,7 @@ class NestedSampler:
             nodes_indices,
             nodes_volumes,
             nodes_chols,
+            HZ
         )
     
     @tf.function
@@ -732,29 +966,41 @@ class NestedSampler:
         return final_logZ
     
     @tf.function(jit_compile=True, reduce_retracing=True)
-    def run_chunk(self, state, n_iter):
+    def run_chunk(
+            self,
+            state,
+            n_iter,
+            batch_sorting=tf.constant(True, dtype=tf.bool),
+            replace_history=tf.constant(False, dtype=tf.bool),
+    ):
         def cond(i, state):
-            return i < n_iter
+            return tf.logical_not(
+                tf.logical_or(
+                    i > n_iter,
+                    state[7] - state[5] < self.tolerance
+                )
+            )
         def body(i, state):
-            state = self.run_iteration(state)
+            state = self.run_iteration(state, replace_history=replace_history)
             return i + 1, state
-        _, new_state = tf.while_loop(
+        i, new_state = tf.while_loop(
             cond,
             body,
             (tf.constant(0), state),
         )
-        return new_state
+        return new_state, n_iter-i
 
-    def print_progress(self, new_state, initial_max_distance, printer, lower=None, upper=None, dim_idx=0, final=False):
+    def print_progress(self, new_state, initial_max_distance, printer, lower=None, upper=None, dim_idx=0, final=False, final_sigma=None):
         term_width = printer.term_width
         max_distance, max_logL, min_logL, hist = self.compute_diagnostics(new_state, lower, upper, dim_idx=dim_idx, bins=term_width)
+        logZ = new_state[5]
         sigma = tf.sqrt(new_state[8] / tf.cast(self.n_live, self.dtype))
         print_block = "╔" + "═"*(term_width - 2) + "╗\n"
         print_block += "║ Live cloud size" + " "*(term_width - 18) + "║\n"
         print_block += "╠" + "═"*(term_width - 2) + "╣\n"
         print_block += "║ " + "█"*(int(np.ceil((max_distance/initial_max_distance).numpy()*(term_width - 4)))) + "-"*(term_width - 4 - int(np.ceil((max_distance/initial_max_distance).numpy()*(term_width - 4)))) + " ║\n"
         print_block += "╚" + "═"*(term_width - 2) + "╝\n\n"
-        print_block += f"LogZ          : {new_state[5].numpy():.4f} ± "
+        print_block += f"LogZ          : {logZ.numpy():.4f} ± "
         if tf.math.is_nan(sigma):
             print_block += "------\n"
         else:
@@ -787,9 +1033,10 @@ class NestedSampler:
         print_block += lower_str + " "*(term_width - len(lower_str) - len(upper_str)) + upper_str + "\n"
 
         if final:
+            logZ = self.compute_final_logZ(new_state)
+            sigma = final_sigma
             print_block += "\n"
-            final_logZ = self.compute_final_logZ(new_state)
-            print_block += f"Final LogZ : {final_logZ.numpy():.4f} ± "
+            print_block += f"Final LogZ : {logZ.numpy():.4f} ± "
             if tf.math.is_nan(sigma):
                 print_block += "------\n"
             else:
@@ -813,7 +1060,15 @@ class NestedSampler:
 
         return new_lower, new_upper
 
-    def run(self, update_interval=10, display_param_idx=0, output_width=None, verbose=True):
+    def run(
+            self,
+            update_interval=10,
+            display_param_idx=0,
+            output_width=None,
+            verbose=True,
+            batch_sorting=None,
+            history_correction=None
+    ):
         n_cluster = 2**(self.max_tree_depth + 1) - 1
         new_state = (
             self.live_points,
@@ -823,17 +1078,47 @@ class NestedSampler:
             self.dead_logX,
             self.logZ,
             self.logX,
-            tf.constant(0, dtype=self.dtype),
+            self.logZ_remaining,
             self.H,
             self.iteration,
             tf.zeros((n_cluster,), dtype=tf.bool),
             tf.zeros((n_cluster, self.n_live), dtype=tf.bool),
             tf.zeros((n_cluster,), dtype=self.dtype),
-            tf.zeros((n_cluster, self.ndim, self.ndim), dtype=self.dtype)
+            tf.zeros((n_cluster, self.ndim, self.ndim), dtype=self.dtype),
+            self.HZ
         )
 
-        printer = ProgressPrinter(term_width=output_width)
-        printer.update("Starting sampler...\n")
+        if verbose:
+            printer = ProgressPrinter(term_width=output_width)
+            printer.update("Starting sampler...\n")
+
+        if batch_sorting is None:
+            batch_sorting = self.batch_sorting
+
+        batch_sorting_tf = tf.logical_and(
+            tf.constant(batch_sorting, dtype=tf.bool),
+            self.n_live_updates > 1
+        )
+
+        if history_correction is None:
+            history_correction = self.history_correction
+
+        if self.slice_sampler.expand_to_worst != history_correction:
+            self.slice_sampler = slice_sampler(
+                loglike=self.log_prob_fn_scaled,
+                bounds=(self.scale_fn(self.lower), self.scale_fn(self.upper)),
+                n_iter=self.slice_factor*self.ndim,
+                expand_to_worst=history_correction,
+            )
+
+        history_correction_tf = tf.logical_and(
+            tf.constant(history_correction, dtype=tf.bool),
+            self.n_live_updates > 1
+        )
+
+        if history_correction_tf and not batch_sorting_tf:
+            warning_msg = "History correction is ignored because batch sorting is disabled. Please enable batch sorting to use history correction."
+            printer.update(warning_msg + "\n")
 
         lower = self.lower[display_param_idx]
         upper = self.upper[display_param_idx]
@@ -843,40 +1128,51 @@ class NestedSampler:
         n_remainder = self.n_iter % update_interval
 
         # compile the run_chunk function for better performance
-        _ = self.run_chunk(new_state, n_iter_chunk)
-        _ = self.run_chunk(new_state, n_remainder)
+        #_ = self.run_chunk(new_state, n_iter_chunk)
+        #_ = self.run_chunk(new_state, n_remainder)
 
         initial_max_distance, _, _, _ = self.compute_diagnostics(new_state, lower, upper, dim_idx=display_param_idx)
 
         for i in range(n_chunks):
             logZ_old = new_state[5]
-            new_state = self.run_chunk(new_state, n_iter_chunk)
+            new_state, n_skipped = self.run_chunk(new_state, n_iter_chunk, batch_sorting=batch_sorting_tf, replace_history=history_correction_tf)
             if verbose:
                 lower, upper = self.print_progress(new_state, initial_max_distance, printer, lower=lower, upper=upper, dim_idx=display_param_idx)
             logZ_new = new_state[5]
-            if logZ_new == logZ_old:
+            logZ_remaining = new_state[7]
+            if n_skipped > 0:
                 break
-        last_idx = (i+1)*n_iter_chunk*self.n_live_updates
+        last_idx = ((i+1)*n_iter_chunk - n_skipped)*self.n_live_updates
         if i == n_chunks - 1:
             logZ_old = new_state[5]
-            new_state = self.run_chunk(new_state, n_remainder)
+            new_state, n_skipped = self.run_chunk(new_state, n_remainder, batch_sorting=batch_sorting_tf, replace_history=history_correction_tf)
             if verbose:
                 _, _ = self.print_progress(new_state, initial_max_distance, printer, lower=lower, upper=upper, dim_idx=display_param_idx)
             logZ_new = new_state[5]
-            if logZ_new != logZ_old or n_remainder == 0:
+            logZ_remaining = new_state[7]
+            if n_skipped == 0 or n_remainder == 0:
                 print(f"Maximum number of iterations ({self.n_iter}) reached. Consider increasing n_max_iter")
-            last_idx += n_remainder*self.n_live_updates
+            last_idx += (n_remainder - n_skipped)*self.n_live_updates
         
-        if verbose:
-            _, _ = self.print_progress(new_state, initial_max_distance, printer, lower=lower, upper=upper, dim_idx=display_param_idx, final=True)
-
         dead_points = self.scale_fn_inv(new_state[2][:last_idx])
         live_points = self.scale_fn_inv(new_state[0])
         dead_logL = new_state[3][:last_idx]
         live_logL = new_state[1]
-        sigma = tf.sqrt(new_state[8] / tf.cast(self.n_live, self.dtype))
-        log_weights, weights = self.compute_posterior_weights(new_state[3], new_state[4], new_state[5])
         logZ_final = self.compute_final_logZ(new_state)
+        log_weights, weights = self.compute_posterior_weights(new_state[3], new_state[4], new_state[5])
+        posterior_weights = weights[:last_idx] / tf.reduce_sum(weights[:last_idx])
+        H = tf.reduce_sum(
+            posterior_weights * tf.where(
+                tf.math.is_finite(dead_logL),
+                dead_logL,
+                tf.zeros_like(dead_logL)
+            )
+        ) - logZ_final
+        sigma = tf.sqrt(H / tf.cast(self.n_live, self.dtype))
+
+        if verbose:
+            _, _ = self.print_progress(new_state, initial_max_distance, printer, lower=lower, upper=upper, dim_idx=display_param_idx, final=True, final_sigma=sigma)
+
         results = NestedSamplerResults(
             dead_points,
             dead_logL,
@@ -886,7 +1182,7 @@ class NestedSampler:
             logZ_final,
             sigma,
             new_state[6],
-            new_state[8],
+            H,
             log_weights[:last_idx],
             weights[:last_idx],
             self.n_live
