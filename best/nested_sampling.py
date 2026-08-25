@@ -1,6 +1,5 @@
 import tensorflow as tf
 import numpy as np
-from scipy.stats import qmc
 
 from best.tools import ProgressPrinter, safe_cholesky, slice_sampler, AdaptiveClusterTree
 
@@ -12,6 +11,8 @@ class NestedSamplerResults:
         dead_logL,
         live_points,
         live_logL,
+        all_points,
+        all_logL,
         dead_logX,
         logZ,
         sigma_logZ,
@@ -19,13 +20,15 @@ class NestedSamplerResults:
         H,
         log_weights,
         posterior_weights,
-        n_live
+        n_live,
     ):
 
         self.dead_points = dead_points
         self.dead_logL = dead_logL
         self.live_points = live_points
         self.live_logL = live_logL
+        self.all_points = all_points
+        self.all_logL = all_logL
         self.dead_logX = dead_logX
         self.logZ = logZ
         self.sigma_logZ = sigma_logZ
@@ -50,9 +53,11 @@ class NestedSampler:
         cluster_update_interval=100,
         slice_factor=5,
         slice_step_size=5.0,
+        slice_global_mixing=0.1,
         tolerance=1e-2,
         batch_sorting=True,
         history_correction=False,
+        history_correction_iterations=1,
         seed=42,
         dtype=tf.float32
     ):
@@ -75,10 +80,12 @@ class NestedSampler:
 
         self.slice_factor = int(slice_factor)
         self.slice_step_size = float(slice_step_size)
+        self.slice_global_mixing = float(slice_global_mixing)
 
         self.tolerance = float(tolerance)
         self.batch_sorting = bool(batch_sorting)
         self.history_correction = bool(history_correction)
+        self.history_correction_iterations = int(history_correction_iterations)
         self.seed = tf.constant([seed, seed+1], dtype=tf.int32)
 
         # --------------------------------------------------
@@ -87,18 +94,18 @@ class NestedSampler:
 
         lower, upper = bounds
 
-        lower = np.asarray(lower)
-        upper = np.asarray(upper)
+        self.lower_np = np.asarray(lower)
+        self.upper_np = np.asarray(upper)
 
-        assert lower.ndim == 1
-        assert upper.ndim == 1
-        assert lower.shape == upper.shape
+        assert self.lower_np.ndim == 1
+        assert self.upper_np.ndim == 1
+        assert self.lower_np.shape == self.upper_np.shape
 
-        self.ndim = lower.size
+        self.ndim = self.lower_np.size
         self.dtype = dtype
 
-        self.lower = tf.constant(lower, dtype=self.dtype)
-        self.upper = tf.constant(upper, dtype=self.dtype)
+        self.lower = tf.constant(self.lower_np, dtype=self.dtype)
+        self.upper = tf.constant(self.upper_np, dtype=self.dtype)
 
         self.scales = self.upper - self.lower
         self.means = 0.5 * (self.upper + self.lower)
@@ -106,23 +113,24 @@ class NestedSampler:
         self.scale_fn = lambda x: (x - self.means) / self.scales
         self.scale_fn_inv = lambda y: self.means + y * self.scales
 
+        self.initialise(seed=seed)
 
+
+    def initialise(self, seed=42):
         # --------------------------------------------------
         # Initial live points
         # --------------------------------------------------
 
-        sampler = qmc.LatinHypercube(
-            d=self.ndim,
-            seed=seed,
+        # self.nlive uniform points between 0 and 1 in self.ndim dimensions
+        points = np.random.uniform(
+            low=self.lower_np,
+            high=self.upper_np,
+            size=(self.n_live, self.ndim)
         )
-
-        lhs = sampler.random(self.n_live)
-
-        lhs = lower + lhs * (upper - lower)
 
         self.live_points = self.scale_fn(
             tf.constant(
-                lhs,
+                points,
                 dtype=self.dtype,
             )
         )
@@ -183,15 +191,6 @@ class NestedSampler:
         )
 
         # --------------------------------------------------
-        # Iteration counter
-        # --------------------------------------------------
-
-        self.iteration = tf.constant(
-            0,
-            dtype=tf.int32,
-        )
-
-        # --------------------------------------------------
         # Clustering / ellipsoid sampler
         # --------------------------------------------------
 
@@ -206,6 +205,7 @@ class NestedSampler:
             bounds=(self.scale_fn(self.lower), self.scale_fn(self.upper)),
             n_iter=self.slice_factor*self.ndim,
             expand_to_worst=False,
+            global_mixing=self.slice_global_mixing,
         )
 
     def log_prob_fn_scaled(self, y):
@@ -308,7 +308,8 @@ class NestedSampler:
             nodes_indices,
             nodes_volumes,
             nodes_chols,
-            HZ
+            HZ,
+            nodes_centres,
         ) = state
 
 
@@ -332,12 +333,24 @@ class NestedSampler:
                 nodes_accept,
                 nodes_indices,
                 nodes_volumes,
-                _,
+                nodes_centres,
                 _,
                 _,
                 nodes_chols,
-            ) = self.clusterer.get_all_clusters(
-                live_points
+            ) = tf.cond(
+                tf.greater(self.max_tree_depth, 0),
+                lambda: self.clusterer.get_all_clusters(
+                    live_points
+                ),
+                lambda: (
+                    tf.constant([True], dtype=tf.bool),
+                    tf.ones((1, self.n_live), dtype=tf.bool),
+                    tf.constant([1.0], dtype=self.dtype),
+                    tf.reduce_mean(live_points, axis=0, keepdims=True),
+                    tf.zeros((1, self.ndim, self.ndim), dtype=self.dtype),
+                    tf.zeros((1, self.ndim, self.ndim), dtype=self.dtype),
+                    tf.zeros((1, self.ndim, self.ndim), dtype=self.dtype),
+                )
             )
 
             # =====================================================
@@ -497,16 +510,18 @@ class NestedSampler:
                 nodes_accept,
                 nodes_indices,
                 nodes_volumes,
-                nodes_chols
+                nodes_chols,
+                nodes_centres
             )
         (
             nodes_accept,
             nodes_indices,
             nodes_volumes,
-            nodes_chols
+            nodes_chols,
+            nodes_centres
         ) = tf.cond(
             tf.logical_or(
-                tf.equal(iteration//self.n_live_updates % self.cluster_update_interval, 0),
+                tf.equal(iteration % self.cluster_update_interval, 0),
                 tf.less(iteration, 100)
             ),
             run_clustering,
@@ -514,7 +529,8 @@ class NestedSampler:
                 nodes_accept,
                 nodes_indices,
                 nodes_volumes,
-                nodes_chols
+                nodes_chols,
+                nodes_centres
             )
         )
 
@@ -571,141 +587,304 @@ class NestedSampler:
         )
 
         Ls = tf.gather(nodes_chols, cluster_ids, axis=0)
-        
-        new_points, buffer_points, buffer_logLs = self.slice_sampler.sample(x0s, Ls, worst_logLs, seed=self.seed + tf.stack([iteration, iteration]))
+        # the first cluster is the root cluster containing all points. Its covariance is the global covariance
+        global_L = tf.gather(nodes_chols, 0, axis=0)
+
+        new_points, buffer_points, buffer_logLs = self.slice_sampler.sample(x0s, Ls, global_L, worst_logLs, seed=self.seed + tf.stack([iteration, iteration]))
         new_logLs = self.log_prob_fn_scaled(new_points)
 
 
+        # -------------------------------------------------------------------------
+        # Batch sorting
+        # -------------------------------------------------------------------------
+
         def no_sorting_fn():
-            return worst_logLs, new_logLs, worst_points, new_points, tf.zeros((2*self.n_live_updates,), dtype=tf.int32)
+            # No sorting -> no history correction.
+            return (
+                worst_logLs,
+                new_logLs,
+                worst_points,
+                new_points,
+                tf.zeros((2 * self.n_live_updates,), dtype=tf.int32),
+            )
 
         def batch_sorting_fn():
+
             combined_points = tf.concat(
                 [worst_points, new_points],
                 axis=0,
             )
+
             combined_logLs = tf.concat(
                 [worst_logLs, new_logLs],
                 axis=0,
             )
 
-            # sort based on combined_logLs
-            combined_logLs, sorted_indices = tf.nn.top_k(-combined_logLs, k=2*self.n_live_updates)
-            combined_points = tf.gather(combined_points, sorted_indices)
+            # Sort from worst -> best.
+            combined_logLs, sorted_indices = tf.nn.top_k(
+                -combined_logLs,
+                k=2 * self.n_live_updates,
+            )
+
+            combined_logLs = -combined_logLs
+            combined_points = tf.gather(
+                combined_points,
+                sorted_indices,
+            )
 
             new_dead_points = combined_points[:self.n_live_updates]
-            new_dead_logLs = -combined_logLs[:self.n_live_updates]
-            new_live_points = combined_points[self.n_live_updates:]
-            new_live_logLs = -combined_logLs[self.n_live_updates:]
-            return new_dead_logLs, new_live_logLs, new_dead_points, new_live_points, sorted_indices
+            new_dead_logLs = combined_logLs[:self.n_live_updates]
 
-        new_dead_logLs, new_live_logLs, new_dead_points, new_live_points, sorted_indices = tf.cond(
+            new_live_points = combined_points[self.n_live_updates:]
+            new_live_logLs = combined_logLs[self.n_live_updates:]
+
+            return (
+                new_dead_logLs,
+                new_live_logLs,
+                new_dead_points,
+                new_live_points,
+                sorted_indices,
+            )
+
+        (
+            new_dead_logLs,
+            new_live_logLs,
+            new_dead_points,
+            new_live_points,
+            sorted_indices,
+        ) = tf.cond(
             batch_sorting,
             batch_sorting_fn,
-            no_sorting_fn
+            no_sorting_fn,
         )
 
-        def only_sort_once_fn():
-            return new_dead_logLs, new_live_logLs, new_dead_points, new_live_points
 
-        def replace_history_fn():
-            combined_seed_logLs = tf.concat(
-                [-self.dtype.max * tf.ones_like(worst_logLs), worst_logLs],
-                axis=0
+        # -------------------------------------------------------------------------
+        # History information for the newly generated points
+        #
+        # Each new point initially has:
+        #
+        #   parent_logLs = likelihood threshold used to generate it
+        #
+        #   history_indices = column in buffer_points/buffer_logLs corresponding
+        #                     to its slice-sampling history.
+        #
+        # The original worst points do not have a history and are assigned -inf.
+        # -------------------------------------------------------------------------
+
+        # Before sorting, the first n_live_updates points are the old worst
+        # points, while the second half are the newly generated points.
+        original_parent_logLs = tf.concat(
+            [
+                -self.dtype.max * tf.ones_like(worst_logLs),
+                worst_logLs,
+            ],
+            axis=0,
+        )
+
+        original_history_indices = tf.concat(
+            [
+                -tf.ones(
+                    [self.n_live_updates],
+                    dtype=tf.int32,
+                ),
+                tf.range(
+                    self.n_live_updates,
+                    dtype=tf.int32,
+                ),
+            ],
+            axis=0,
+        )
+
+        parent_logLs_combined = tf.gather(
+            original_parent_logLs,
+            sorted_indices,
+        )
+
+        history_indices_combined = tf.gather(
+            original_history_indices,
+            sorted_indices,
+        )
+
+        new_dead_parent_logLs = parent_logLs_combined[
+            :self.n_live_updates
+        ]
+
+        parent_logLs = parent_logLs_combined[
+            self.n_live_updates:
+        ]
+
+        new_dead_history_indices = history_indices_combined[
+            :self.n_live_updates
+        ]
+
+        history_indices = history_indices_combined[
+            self.n_live_updates:
+        ]
+
+
+        # -------------------------------------------------------------------------
+        # Iterative history correction
+        # -------------------------------------------------------------------------
+
+        def history_correction_step(
+                dead_logLs,
+                live_logLs,
+                dead_points,
+                live_points,
+                dead_parent_logLs,
+                live_parent_logLs,
+                dead_history_indices,
+                live_history_indices,
+        ):
+
+            # -------------------------------------------------------------
+            # A live point is problematic if its parent threshold is >=
+            # the worst current live likelihood.
+            #
+            # Its parent is therefore still alive and the point was generated
+            # under a threshold which is no longer represented by a dead point.
+            # -------------------------------------------------------------
+
+            invalid = live_parent_logLs >= live_logLs[0]
+
+            # -------------------------------------------------------------
+            # Find relaxed thresholds.
+            #
+            # A dead point with a finite parent threshold represents a point
+            # that was generated during this batch and subsequently became
+            # an instant death / revived point.
+            # -------------------------------------------------------------
+
+            relaxed = dead_parent_logLs > -self.dtype.max
+
+            relaxed_id = tf.cumsum(
+                tf.cast(relaxed, tf.int32),
+                exclusive=True,
             )
-            combined_seed_logLs = tf.gather(combined_seed_logLs, sorted_indices)
-            new_dead_seed_logLs = combined_seed_logLs[:self.n_live_updates]
-            new_live_seed_logLs = combined_seed_logLs[self.n_live_updates:]
-
-            invalid = new_live_seed_logLs >= new_live_logLs[0]
-
-            relaxed = new_dead_seed_logLs > -self.dtype.max
-
-            invalid_id = tf.cumsum(tf.cast(invalid, tf.int32), exclusive=True)
-
-            invalid_id = tf.where(
-                invalid,
-                invalid_id,
-                tf.fill([self.n_live_updates], -1)
-            )
-
-            relaxed_id = tf.cumsum(tf.cast(relaxed, tf.int32), exclusive=True)
 
             relaxed_id = tf.where(
                 relaxed,
                 relaxed_id,
-                tf.fill([self.n_live_updates], -1)
+                tf.fill(
+                    [self.n_live_updates],
+                    -1,
+                ),
             )
 
-            ids = tf.range(self.n_live_updates)
+            ids = tf.range(
+                self.n_live_updates,
+                dtype=tf.int32,
+            )
 
+            # For each relaxed point, obtain the likelihood of the corresponding
+            # dead point. These are the relaxed likelihood thresholds.
             threshold_lookup = tf.reduce_max(
                 tf.where(
                     ids[:, None] == relaxed_id[None, :],
-                    new_dead_logLs[None, :],
-                    tf.fill([self.n_live_updates, self.n_live_updates], -self.dtype.max),
+                    dead_logLs[None, :],
+                    tf.fill(
+                        [self.n_live_updates, self.n_live_updates],
+                        -self.dtype.max,
+                    ),
                 ),
                 axis=1,
             )
 
-            safe_invalid_id = tf.maximum(invalid_id,0)
+            # Invalid live points are matched, in order, to the relaxed dead
+            # thresholds.
+            invalid_id = tf.cumsum(
+                tf.cast(invalid, tf.int32),
+                exclusive=True,
+            )
 
+            invalid_id = tf.where(
+                invalid,
+                invalid_id,
+                tf.fill(
+                    [self.n_live_updates],
+                    -1,
+                ),
+            )
+
+            safe_invalid_id = tf.maximum(
+                invalid_id,
+                0,
+            )
+    
             replacement_thresholds = tf.gather(
                 threshold_lookup,
-                safe_invalid_id
+                safe_invalid_id,
             )
 
             replacement_thresholds = tf.where(
                 invalid,
                 replacement_thresholds,
-                tf.fill([self.n_live_updates], self.dtype.max)
+                tf.fill(
+                    [self.n_live_updates],
+                    self.dtype.max,
+                ),
             )
 
-            seed_match = (
-                new_live_seed_logLs[:,None]
-                == worst_logLs[None,:]
-            )
+            # -------------------------------------------------------------
+            # Retrieve the history corresponding to each live point.
+            #
+            # history_indices tells us which original slice-sampling
+            # trajectory to use.
+            # -------------------------------------------------------------
 
-            buffer_indices = tf.argmax(
-                tf.cast(seed_match,tf.int32),
-                axis=1,
-                output_type=tf.int32
+            safe_history_indices = tf.maximum(
+                live_history_indices,
+                0,
             )
 
             history_logLs = tf.gather(
                 buffer_logLs,
-                buffer_indices,
-                axis=1
-            )
-
-            history_logLs = tf.where(
-                invalid[None,:],
-                history_logLs,
-                -self.dtype.max
+                safe_history_indices,
+                axis=1,
             )
 
             history_points = tf.gather(
                 buffer_points,
-                buffer_indices,
-                axis=1
+                safe_history_indices,
+                axis=1,
+            )
+
+            history_logLs = tf.where(
+                invalid[None, :],
+                history_logLs,
+                tf.fill(
+                    tf.shape(history_logLs),
+                    -self.dtype.max,
+                ),
             )
 
             history_points = tf.where(
-                invalid[:,None],
+                invalid[None, :, None],
                 history_points,
-                tf.ones_like(history_points)*(-self.dtype.max)
+                tf.ones_like(history_points) * (-self.dtype.max),
             )
 
-            above = history_logLs > replacement_thresholds[None,:]
+            # -------------------------------------------------------------
+            # Find the first history point above the relaxed threshold.
+            # -------------------------------------------------------------
+
+            above = (
+                history_logLs
+                > replacement_thresholds[None, :]
+            )
 
             prev = tf.concat(
-                [tf.zeros_like(above[:1]), above[:-1]],
+                [
+                    tf.zeros_like(above[:1]),
+                    above[:-1],
+                ],
                 axis=0,
             )
 
-            first = tf.math.logical_and(
+            first = tf.logical_and(
                 above,
-                tf.logical_not(prev)
+                tf.logical_not(prev),
             )
 
             history_idx = tf.argmax(
@@ -714,9 +893,15 @@ class NestedSampler:
                 output_type=tf.int32,
             )
 
-            cols = tf.range(self.n_live_updates, dtype=tf.int32)
+            cols = tf.range(
+                self.n_live_updates,
+                dtype=tf.int32,
+            )
 
-            idx = tf.stack([history_idx, cols], axis=1)
+            idx = tf.stack(
+                [history_idx, cols],
+                axis=1,
+            )
 
             history_logLs_selected = tf.gather_nd(
                 history_logLs,
@@ -728,39 +913,96 @@ class NestedSampler:
                 idx,
             )
 
-            history_found = tf.reduce_any(first, axis=0)
+            history_found = tf.reduce_any(
+                first,
+                axis=0,
+            )
 
             history_logLs_selected = tf.where(
                 history_found,
                 history_logLs_selected,
-                tf.fill([self.n_live_updates], self.dtype.max),
+                tf.fill(
+                    [self.n_live_updates],
+                    self.dtype.max,
+                ),
             )
 
             history_points_selected = tf.where(
-                history_found[:,None],
+                history_found[:, None],
                 history_points_selected,
-                tf.ones_like(history_points_selected)*(-self.dtype.max),
+                tf.ones_like(history_points_selected)
+                * (-self.dtype.max),
             )
 
-            actual_new_logLs = tf.where(
+            # -------------------------------------------------------------
+            # Replace problematic live points.
+            # -------------------------------------------------------------
+
+            actual_live_logLs = tf.where(
                 invalid,
                 history_logLs_selected,
-                new_live_logLs,
+                live_logLs,
             )
 
-            actual_new_points = tf.where(
-                invalid[:,None],
+            actual_live_points = tf.where(
+                invalid[:, None],
                 history_points_selected,
-                new_live_points,
+                live_points,
             )
+
+            # The important part for iterative correction:
+            #
+            # A corrected point was generated using the relaxed threshold,
+            # so its NEW parent is that relaxed threshold.
+            #
+            # Its history index remains the same because we are reusing the
+            # existing slice-sampling history rather than doing new sampling.
+            # -------------------------------------------------------------
+
+            actual_parent_logLs = tf.where(
+                invalid,
+                replacement_thresholds,
+                live_parent_logLs,
+            )
+
+            actual_history_indices = live_history_indices
+
+            # -------------------------------------------------------------
+            # Sort dead + live points again.
+            #
+            # Parent information and history indices must be sorted together
+            # with their associated points.
+            # -------------------------------------------------------------
 
             combined_logLs = tf.concat(
-                [new_dead_logLs, actual_new_logLs],
+                [
+                    dead_logLs,
+                    actual_live_logLs,
+                ],
                 axis=0,
             )
 
             combined_points = tf.concat(
-                [new_dead_points, actual_new_points],
+                [
+                    dead_points,
+                    actual_live_points,
+                ],
+                axis=0,
+            )
+
+            combined_parent_logLs = tf.concat(
+                [
+                    dead_parent_logLs,
+                    actual_parent_logLs,
+                ],
+                axis=0,
+            )
+
+            combined_history_indices = tf.concat(
+                [
+                    dead_history_indices,
+                    actual_history_indices,
+                ],
                 axis=0,
             )
 
@@ -770,27 +1012,227 @@ class NestedSampler:
                 stable=True,
             )
 
-            combined_logLs = tf.gather(combined_logLs, order)
-            combined_points = tf.gather(combined_points, order)
+            combined_logLs = tf.gather(
+                combined_logLs,
+                order,
+            )
 
-            actual_worst_logLs = combined_logLs[:self.n_live_updates]
-            actual_new_logLs = combined_logLs[self.n_live_updates:]
+            combined_points = tf.gather(
+                combined_points,
+                order,
+            )
 
-            actual_worst_points = combined_points[:self.n_live_updates]
-            actual_new_points = combined_points[self.n_live_updates:]
+            combined_parent_logLs = tf.gather(
+                combined_parent_logLs,
+                order,
+            )
 
-            return actual_worst_logLs, actual_new_logLs, actual_worst_points, actual_new_points
+            combined_history_indices = tf.gather(
+                combined_history_indices,
+                order,
+            )
+
+            actual_dead_logLs = combined_logLs[
+                :self.n_live_updates
+            ]
+
+            actual_live_logLs = combined_logLs[
+                self.n_live_updates:
+            ]
+
+            actual_dead_points = combined_points[
+                :self.n_live_updates
+            ]
+
+            actual_live_points = combined_points[
+                self.n_live_updates:
+            ]
+
+            actual_dead_parent_logLs = combined_parent_logLs[
+                :self.n_live_updates
+            ]
+
+            actual_live_parent_logLs = combined_parent_logLs[
+                self.n_live_updates:
+            ]
+
+            actual_dead_history_indices = combined_history_indices[
+                :self.n_live_updates
+            ]
+
+            actual_live_history_indices = combined_history_indices[
+                self.n_live_updates:
+            ]
+
+            # -------------------------------------------------------------
+            # Determine whether another correction pass is required.
+            # -------------------------------------------------------------
+
+            still_invalid = (
+                actual_live_parent_logLs
+                >= actual_live_logLs[0]
+            )
+
+            any_invalid = tf.reduce_any(
+                still_invalid
+            )
+
+            return (
+                actual_dead_logLs,
+                actual_live_logLs,
+                actual_dead_points,
+                actual_live_points,
+                actual_dead_parent_logLs,
+                actual_live_parent_logLs,
+                actual_dead_history_indices,
+                actual_live_history_indices,
+                any_invalid,
+            )
 
 
-        actual_worst_logLs, actual_new_logLs, actual_worst_points, actual_new_points = tf.cond(
+        # -------------------------------------------------------------------------
+        # Run history correction repeatedly.
+        # -------------------------------------------------------------------------
+
+        max_history_corrections = self.history_correction_iterations
+
+        def correction_cond(
+                iteration,
+                dead_logLs,
+                live_logLs,
+                dead_points,
+                live_points,
+                dead_parent_logLs,
+                live_parent_logLs,
+                dead_history_indices,
+                live_history_indices,
+                any_invalid,
+        ):
+
+            return tf.logical_and(
+                iteration < max_history_corrections,
+                any_invalid,
+            )
+
+        def correction_body(
+                iteration,
+                dead_logLs,
+                live_logLs,
+                dead_points,
+                live_points,
+                dead_parent_logLs,
+                live_parent_logLs,
+                dead_history_indices,
+                live_history_indices,
+                any_invalid,
+        ):
+
+            (
+                dead_logLs,
+                live_logLs,
+                dead_points,
+                live_points,
+                dead_parent_logLs,
+                live_parent_logLs,
+                dead_history_indices,
+                live_history_indices,
+                any_invalid,
+            ) = history_correction_step(
+                dead_logLs,
+                live_logLs,
+                dead_points,
+                live_points,
+                dead_parent_logLs,
+                live_parent_logLs,
+                dead_history_indices,
+                live_history_indices,
+            )
+
+            return (
+                iteration + 1,
+                dead_logLs,
+                live_logLs,
+                dead_points,
+                live_points,
+                dead_parent_logLs,
+                live_parent_logLs,
+                dead_history_indices,
+                live_history_indices,
+                any_invalid,
+            )
+
+        # If history correction is disabled, just return the once-sorted result.
+        #
+        # Otherwise perform up to history_correction_iterations passes.
+        def do_history_correction():
+
+            # Determine whether there is anything to correct initially.
+            initial_invalid = (
+                parent_logLs >= new_live_logLs[0]
+            )
+
+            initial_any_invalid = tf.reduce_any(
+                initial_invalid
+            )
+
+            (
+                _,
+                final_dead_logLs,
+                final_live_logLs,
+                final_dead_points,
+                final_live_points,
+                final_dead_parent_logLs,
+                final_live_parent_logLs,
+                final_dead_history_indices,
+                final_live_history_indices,
+                _,
+            ) = tf.while_loop(
+                correction_cond,
+                correction_body,
+                (
+                    tf.constant(0, dtype=tf.int32),
+                    new_dead_logLs,
+                    new_live_logLs,
+                    new_dead_points,
+                    new_live_points,
+                    new_dead_parent_logLs,
+                    parent_logLs,
+                    new_dead_history_indices,
+                    history_indices,
+                    initial_any_invalid,
+                ),
+            )
+
+            return (
+                final_dead_logLs,
+                final_live_logLs,
+                final_dead_points,
+                final_live_points,
+            )
+
+        def only_sort_once_fn():
+            return (
+                new_dead_logLs,
+                new_live_logLs,
+                new_dead_points,
+                new_live_points,
+            )
+
+        (
+            actual_worst_logLs,
+            actual_new_logLs,
+            actual_worst_points,
+            actual_new_points,
+        ) = tf.cond(
             tf.logical_and(
                 replace_history,
-                batch_sorting
+                batch_sorting,
             ),
-            replace_history_fn,
-            only_sort_once_fn
+            do_history_correction,
+            only_sort_once_fn,
         )
-        
+
+
         # --------------------------------------------------
         # Store dead point
         # --------------------------------------------------
@@ -813,6 +1255,47 @@ class NestedSampler:
             actual_worst_logLs,
         )
 
+        # --------------------------------------------------
+        # Identify clusters for new points
+        # --------------------------------------------------
+
+        distances = tf.norm(
+            actual_new_points[:, None, :] - nodes_centres[None, :, :],
+            axis=-1
+        )
+
+        # set distances to inf for clusters that are not accepted
+        distances = tf.where(
+            nodes_accept[None, :],
+            distances,
+            tf.fill(
+                tf.shape(distances),
+                tf.constant(self.dtype.max, self.dtype)
+            )
+        )
+
+        closest_cluster_ids = tf.cast(tf.argmin(
+            distances,
+            axis=1
+        ), tf.int32)
+
+        nodes_indices = tf.tensor_scatter_nd_update(
+            nodes_indices,
+            tf.stack([
+                cluster_ids,
+                worst_indices
+            ], axis=1),
+            tf.zeros((self.n_live_updates,), dtype=tf.bool)
+        )
+
+        nodes_indices = tf.tensor_scatter_nd_update(
+            nodes_indices,
+            tf.stack([
+                closest_cluster_ids,
+                worst_indices
+            ], axis=1),
+            tf.ones((self.n_live_updates,), dtype=tf.bool)
+        )
 
         # --------------------------------------------------
         # Replace live point
@@ -877,6 +1360,13 @@ class NestedSampler:
 
         iteration = iteration + self.n_live_updates
 
+        n_nodes = 2 ** (self.max_tree_depth + 1) - 1
+        nodes_accept = tf.ensure_shape(nodes_accept, (n_nodes,))
+        nodes_indices = tf.ensure_shape(nodes_indices, (n_nodes, self.n_live))
+        nodes_volumes = tf.ensure_shape(nodes_volumes, (n_nodes,))
+        nodes_chols = tf.ensure_shape(nodes_chols, (n_nodes, self.ndim, self.ndim))
+        nodes_centres = tf.ensure_shape(nodes_centres, (n_nodes, self.ndim))
+
         return (
             live_points,
             live_logL,
@@ -892,7 +1382,8 @@ class NestedSampler:
             nodes_indices,
             nodes_volumes,
             nodes_chols,
-            HZ
+            HZ,
+            nodes_centres,
         )
     
     @tf.function
@@ -921,10 +1412,12 @@ class NestedSampler:
         )
 
         return max_distance, max_logL, min_logL, hist
-    
-    @tf.function(jit_compile=True, reduce_retracing=True)
-    def compute_posterior_weights(self, dead_logL, dead_logX, logZ):
 
+
+    @tf.function(jit_compile=True, reduce_retracing=True)
+    def compute_posterior_weights(self, dead_logL, dead_logX, live_logL, logX, logZ):
+
+        # Dead point weights
         previous_logX = tf.concat(
             [
                 tf.zeros((1,), dtype=self.dtype),
@@ -938,12 +1431,31 @@ class NestedSampler:
             dead_logX,
         )
 
-        log_weights = (
+        dead_log_weights = (
             dead_logL
             +
             log_widths
             -
             logZ
+        )
+
+        live_log_weights = (
+            live_logL
+            +
+            logX
+            -
+            tf.math.log(tf.cast(self.n_live, tf.float32))
+            -
+            logZ
+        )
+
+        # Combine
+        log_weights = tf.concat(
+            [
+                dead_log_weights,
+                live_log_weights
+            ],
+            axis=0
         )
 
         weights = tf.exp(log_weights)
@@ -964,7 +1476,7 @@ class NestedSampler:
             )
         )
         return final_logZ
-    
+
     @tf.function(jit_compile=True, reduce_retracing=True)
     def run_chunk(
             self,
@@ -976,7 +1488,7 @@ class NestedSampler:
         def cond(i, state):
             return tf.logical_not(
                 tf.logical_or(
-                    i > n_iter,
+                    i >= n_iter,
                     state[7] - state[5] < self.tolerance
                 )
             )
@@ -1067,8 +1579,13 @@ class NestedSampler:
             output_width=None,
             verbose=True,
             batch_sorting=None,
-            history_correction=None
+            history_correction=None,
+            history_correction_iterations=None,
+            seed=None,
     ):
+        if seed is not None:
+            self.seed = tf.constant([seed, seed+1], dtype=tf.int32)
+            self.initialise(seed=seed)
         n_cluster = 2**(self.max_tree_depth + 1) - 1
         new_state = (
             self.live_points,
@@ -1080,12 +1597,13 @@ class NestedSampler:
             self.logX,
             self.logZ_remaining,
             self.H,
-            self.iteration,
+            tf.constant(0, dtype=tf.int32),
             tf.zeros((n_cluster,), dtype=tf.bool),
             tf.zeros((n_cluster, self.n_live), dtype=tf.bool),
             tf.zeros((n_cluster,), dtype=self.dtype),
             tf.zeros((n_cluster, self.ndim, self.ndim), dtype=self.dtype),
-            self.HZ
+            self.HZ,
+            tf.zeros((n_cluster, self.ndim), dtype=self.dtype),
         )
 
         if verbose:
@@ -1120,16 +1638,15 @@ class NestedSampler:
             warning_msg = "History correction is ignored because batch sorting is disabled. Please enable batch sorting to use history correction."
             printer.update(warning_msg + "\n")
 
+        if history_correction_iterations is not None:
+            self.history_correction_iterations = history_correction_iterations
+
         lower = self.lower[display_param_idx]
         upper = self.upper[display_param_idx]
 
         n_chunks = self.n_iter // update_interval
         n_iter_chunk = update_interval
         n_remainder = self.n_iter % update_interval
-
-        # compile the run_chunk function for better performance
-        #_ = self.run_chunk(new_state, n_iter_chunk)
-        #_ = self.run_chunk(new_state, n_remainder)
 
         initial_max_distance, _, _, _ = self.compute_diagnostics(new_state, lower, upper, dim_idx=display_param_idx)
 
@@ -1142,6 +1659,7 @@ class NestedSampler:
             logZ_remaining = new_state[7]
             if n_skipped > 0:
                 break
+
         last_idx = ((i+1)*n_iter_chunk - n_skipped)*self.n_live_updates
         if i == n_chunks - 1:
             logZ_old = new_state[5]
@@ -1153,19 +1671,23 @@ class NestedSampler:
             if n_skipped == 0 or n_remainder == 0:
                 print(f"Maximum number of iterations ({self.n_iter}) reached. Consider increasing n_max_iter")
             last_idx += (n_remainder - n_skipped)*self.n_live_updates
-        
+
         dead_points = self.scale_fn_inv(new_state[2][:last_idx])
         live_points = self.scale_fn_inv(new_state[0])
         dead_logL = new_state[3][:last_idx]
         live_logL = new_state[1]
         logZ_final = self.compute_final_logZ(new_state)
-        log_weights, weights = self.compute_posterior_weights(new_state[3], new_state[4], new_state[5])
-        posterior_weights = weights[:last_idx] / tf.reduce_sum(weights[:last_idx])
+        log_weights, weights = self.compute_posterior_weights(new_state[3], new_state[4], new_state[1], new_state[6], logZ_final)
+        weights = tf.concat([weights[:last_idx], weights[-self.n_live:]], axis=0)
+        log_weights = tf.concat([log_weights[:last_idx], log_weights[-self.n_live:]], axis=0)
+        posterior_weights = weights / tf.reduce_sum(weights)
+        all_points = tf.concat([dead_points, live_points], axis=0)
+        all_logL = tf.concat([dead_logL, live_logL], axis=0)
         H = tf.reduce_sum(
             posterior_weights * tf.where(
-                tf.math.is_finite(dead_logL),
-                dead_logL,
-                tf.zeros_like(dead_logL)
+                tf.math.is_finite(all_logL),
+                all_logL,
+                tf.zeros_like(all_logL)
             )
         ) - logZ_final
         sigma = tf.sqrt(H / tf.cast(self.n_live, self.dtype))
@@ -1178,13 +1700,15 @@ class NestedSampler:
             dead_logL,
             live_points,
             live_logL,
+            all_points,
+            all_logL,
             new_state[4][:last_idx],
             logZ_final,
             sigma,
             new_state[6],
             H,
-            log_weights[:last_idx],
-            weights[:last_idx],
-            self.n_live
+            log_weights,
+            weights,
+            self.n_live,
         )
-        return results 
+        return results

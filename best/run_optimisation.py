@@ -303,7 +303,9 @@ class Optimiser:
         mappable.set_array(lkl)
         plt.colorbar(mappable, label=r'$-log \mathcal{L}$', ax=ax)
         plt.subplots_adjust(right=1.0)
-        plt.show()
+
+        if ax is None:
+            plt.show()
 
     def plot_profile_1d(self,
                         opt_res,
@@ -335,7 +337,8 @@ class Optimiser:
         if confidence_intervals:
             self.compute_ci(ax, p, lkl, lkl_min_global)
 
-        plt.show()
+        if ax is None:
+            plt.show()
 
     def compute_ci(self,
                    ax,

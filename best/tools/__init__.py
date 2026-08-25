@@ -747,40 +747,73 @@ class AdaptiveClusterTree:
         )
 
         # --------------------------------------------------------
-        # Initial centre
+        # First centre:
+        # point farthest from the active mean
         # --------------------------------------------------------
 
-        centre0 = (
+        mean = (
             tf.reduce_sum(
                 points * weights[:, None],
                 axis=0
             ) / n_active
         )
 
-        diff = points - centre0
-
         dist2 = tf.reduce_sum(
-            diff * diff,
-            axis=1
+            (points - mean) ** 2,
+            axis=1,
         )
 
-        # Ignore inactive points when choosing the furthest point
         dist2 = tf.where(
             active_mask,
             dist2,
-            tf.fill(tf.shape(dist2), tf.constant(-1e30, dtype))
+            tf.fill(
+                tf.shape(dist2),
+                tf.constant(-np.inf, dtype),
+            ),
+        )
+
+        index0 = tf.argmax(
+            dist2,
+            output_type=tf.int32,
+        )
+
+        centre0 = tf.gather(
+            points,
+            index0,
+        )
+
+        # --------------------------------------------------------
+        # Second centre:
+        # point farthest from the first centre
+        # --------------------------------------------------------
+
+        dist2 = tf.reduce_sum(
+            (points - centre0) ** 2,
+            axis=1,
+        )
+
+        dist2 = tf.where(
+            active_mask,
+            dist2,
+            tf.fill(
+                tf.shape(dist2),
+                tf.constant(-np.inf, dtype),
+            ),
         )
 
         index1 = tf.argmax(
             dist2,
-            output_type=tf.int32
+            output_type=tf.int32,
         )
 
-        centre1 = tf.gather(points, index1)
+        centre1 = tf.gather(
+            points,
+            index1,
+        )
 
         centres = tf.stack(
             [centre0, centre1],
-            axis=0
+            axis=0,
         )
 
         # --------------------------------------------------------
@@ -938,7 +971,7 @@ class AdaptiveClusterTree:
 
 
 class slice_sampler:
-    def __init__(self, loglike, bounds, n_iter=10, max_expand=20, max_shrink=100, buffer_size=100, expand_to_worst=False):
+    def __init__(self, loglike, bounds, n_iter=10, max_expand=2000, max_shrink=10000, buffer_size=100, expand_to_worst=False, global_mixing=0.1):
         self.loglike = loglike
         self.lower, self.upper = bounds
         self.n_iter = n_iter
@@ -947,12 +980,14 @@ class slice_sampler:
         self.buffer_size = buffer_size
         self.expand_to_worst = expand_to_worst
         self.expand_to_worst_tf = tf.convert_to_tensor(expand_to_worst, dtype=tf.bool)
+        self.global_mixing = global_mixing
 
     @tf.function(jit_compile=True, reduce_retracing=True)
     def sample(
         self,
         x0s,
         chols,
+        global_chol,
         worst_logLs,
         seed=tf.constant([123,456], tf.int32)
     ):
@@ -960,6 +995,7 @@ class slice_sampler:
         dtype = x0s.dtype
         n_updates = x0s.shape[0]
         ndim      = x0s.shape[1]
+        n_clusters = chols.shape[0]
         buffer_points = tf.zeros((self.buffer_size, n_updates, ndim), dtype=dtype)
         buffer_logL   = tf.ones((self.buffer_size, n_updates), dtype=dtype)*(-dtype.max)
 
@@ -983,11 +1019,13 @@ class slice_sampler:
             # -------------------------------------------------
 
             seed2 = seed + tf.stack([i+1, tf.range(n_updates)[0]+1])
+            seed_dir = seed2 + tf.stack([i + 1, tf.constant(1, tf.int32)])
+            seed_mix = seed2 + tf.stack([i + 1, tf.constant(2, tf.int32)])
 
             dir_normal = tf.random.stateless_normal(
                 (n_updates, ndim),
                 dtype=dtype,
-                seed=seed2
+                seed=seed_dir
             )
 
             dir_normal /= tf.linalg.norm(
@@ -996,9 +1034,33 @@ class slice_sampler:
                 keepdims=True,
             )
 
+            def get_chols():
+                seed_mix = seed2 + tf.stack([i + 1, tf.constant(2, tf.int32)])
+
+                mix = tf.random.stateless_uniform(
+                    (n_updates,),
+                    seed=seed_mix,
+                    dtype=dtype,
+                )
+
+                use_global = mix < self.global_mixing
+
+                selected_chols = tf.where(
+                    use_global[:, None, None],
+                    global_chol[None, :, :],
+                    chols,
+                )
+                return selected_chols
+
+            selected_chols = tf.cond(
+                tf.greater(n_clusters, 1),
+                get_chols,
+                lambda: chols,
+            )
+
             vs = tf.einsum(
                 "bij,bj->bi",
-                chols,
+                selected_chols,
                 dir_normal,
             )
 
@@ -1101,7 +1163,7 @@ class slice_sampler:
 
                 grow_a = tf.cast(
                     tf.logical_not(
-                        tf.logical_and(
+                        tf.logical_or(
                             logL_a < expand_compare_logLs,
                             tf.logical_not(inside_a),
                         )
@@ -1111,7 +1173,7 @@ class slice_sampler:
 
                 grow_b = tf.cast(
                     tf.logical_not(
-                        tf.logical_and(
+                        tf.logical_or(
                             logL_b < expand_compare_logLs,
                             tf.logical_not(inside_b),
                         )
@@ -1204,7 +1266,10 @@ class slice_sampler:
                 buffer_logL,
             ):
 
-                seed3 = seed + tf.stack([i+k+1, tf.range(n_updates)[0]+1])
+                seed3 = seed + tf.stack([
+                    100000 * (i + 1) + k + 1,
+                    100000 * (k + 1) + i + 1
+                ])
 
                 t = tf.random.stateless_uniform(
                     (n_updates, 1),
@@ -1563,4 +1628,3 @@ class ProgressPrinter:
             print(text, end="")
 
             self.n_lines = text.count("\n")
-
