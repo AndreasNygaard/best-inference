@@ -1224,7 +1224,7 @@ class slice_sampler:
                     grow_b,
                 ),
             )
-
+            """
             # -------------------------------------------------
             # shrinkage
             # -------------------------------------------------
@@ -1401,6 +1401,277 @@ class slice_sampler:
                     t_final,
                     buffer_points,
                     buffer_logL
+                ),
+            )
+            """
+            # -------------------------------------------------
+            # shrinkage
+            # -------------------------------------------------
+            
+            accepted = tf.zeros(
+                (n_updates, 1),
+                dtype=dtype,
+            )
+            
+            t_final = tf.zeros(
+                (n_updates, 1),
+                dtype=dtype,
+            )
+            
+            
+            def shrink_cond(
+                k,
+                a,
+                b,
+                accepted,
+                t_final,
+                buffer_points,
+                buffer_logL,
+            ):
+                return tf.logical_and(
+                    k < self.max_shrink,
+                    tf.reduce_sum(accepted)
+                    < tf.cast(n_updates, dtype),
+                )
+            
+            
+            def shrink_body(
+                k,
+                a,
+                b,
+                accepted,
+                t_final,
+                buffer_points,
+                buffer_logL,
+            ):
+            
+                # -------------------------------------------------
+                # Which chains are active BEFORE this proposal?
+                #
+                # Important: if this proposal is accepted, it still
+                # belongs to that chain's shrink history and must be
+                # saved.
+                # -------------------------------------------------
+            
+                active_before = tf.squeeze(
+                    accepted < tf.cast(0.5, dtype),
+                    axis=1,
+                )
+                # shape: [n_updates]
+            
+            
+                # -------------------------------------------------
+                # Generate proposal
+                # -------------------------------------------------
+            
+                seed3 = seed + tf.stack([
+                    100000 * (i + 1) + k + 1,
+                    100000 * (k + 1) + i + 1,
+                ])
+            
+                t = tf.random.stateless_uniform(
+                    (n_updates, 1),
+                    minval=a,
+                    maxval=b,
+                    dtype=dtype,
+                    seed=seed3,
+                )
+            
+                x_t = x(t)
+            
+                inside = inside_prior(x_t)
+            
+                logL_t = self.loglike(x_t)
+            
+                good = tf.cast(
+                    tf.logical_and(
+                        logL_t > worst_logLs,
+                        inside,
+                    ),
+                    dtype,
+                )[:, None]
+            
+            
+                # -------------------------------------------------
+                # Save shrink history ONLY on the final slice
+                # iteration.
+                #
+                # Desired semantics for each chain:
+                #
+                #     [... oldest ... newest ... accepted]
+                #
+                # If fewer than buffer_size proposals have occurred,
+                # the left side remains filled with the original
+                # sentinel values.
+                #
+                # Once a chain accepts, its column is frozen.
+                # -------------------------------------------------
+            
+                def save_shrink_history():
+            
+                    # Drop the oldest history entry and append the
+                    # current proposal on the right.
+                    #
+                    # buffer_points:
+                    #   [buffer_size, n_updates, ndim]
+                    #
+                    # x_t[None, ...]:
+                    #   [1, n_updates, ndim]
+            
+                    shifted_points = tf.concat(
+                        [
+                            buffer_points[1:],
+                            x_t[None, :, :],
+                        ],
+                        axis=0,
+                    )
+            
+                    # buffer_logL:
+                    #   [buffer_size, n_updates]
+                    #
+                    # logL_t[None, :]:
+                    #   [1, n_updates]
+            
+                    shifted_logL = tf.concat(
+                        [
+                            buffer_logL[1:],
+                            logL_t[None, :],
+                        ],
+                        axis=0,
+                    )
+            
+                    # Only active chains get their history shifted
+                    # and appended.
+                    #
+                    # Already accepted chains retain their buffer
+                    # exactly as it was at the moment they accepted.
+            
+                    buffer_points_new = tf.where(
+                        active_before[None, :, None],
+                        shifted_points,
+                        buffer_points,
+                    )
+            
+                    buffer_logL_new = tf.where(
+                        active_before[None, :],
+                        shifted_logL,
+                        buffer_logL,
+                    )
+            
+                    return (
+                        buffer_points_new,
+                        buffer_logL_new,
+                    )
+            
+            
+                buffer_points, buffer_logL = tf.cond(
+                    tf.equal(i, self.n_iter - 1),
+                    save_shrink_history,
+                    lambda: (
+                        buffer_points,
+                        buffer_logL,
+                    ),
+                )
+            
+            
+                # -------------------------------------------------
+                # Accept proposal
+                # -------------------------------------------------
+            
+                new_accept = (
+                    (1.0 - accepted)
+                    * good
+                )
+            
+                t_final = (
+                    (1.0 - new_accept)
+                    * t_final
+                    +
+                    new_accept
+                    * t
+                )
+            
+                accepted = tf.maximum(
+                    accepted,
+                    good,
+                )
+            
+            
+                # -------------------------------------------------
+                # Only update intervals for chains that are still
+                # active AFTER this proposal.
+                # -------------------------------------------------
+            
+                active = 1.0 - accepted
+            
+                t_neg = tf.cast(
+                    t < 0.0,
+                    dtype,
+                )
+            
+                t_pos = 1.0 - t_neg
+            
+                bad = 1.0 - good
+            
+                update_a = (
+                    active
+                    * bad
+                    * t_neg
+                )
+            
+                update_b = (
+                    active
+                    * bad
+                    * t_pos
+                )
+            
+                a = (
+                    (1.0 - update_a)
+                    * a
+                    +
+                    update_a
+                    * t
+                )
+            
+                b = (
+                    (1.0 - update_b)
+                    * b
+                    +
+                    update_b
+                    * t
+                )
+            
+            
+                return (
+                    k + 1,
+                    a,
+                    b,
+                    accepted,
+                    t_final,
+                    buffer_points,
+                    buffer_logL,
+                )
+            
+            
+            (
+                n_shrink,
+                _,
+                _,
+                accepted,
+                t_final,
+                buffer_points,
+                buffer_logL,
+            ) = tf.while_loop(
+                shrink_cond,
+                shrink_body,
+                (
+                    tf.constant(0),
+                    a,
+                    b,
+                    accepted,
+                    t_final,
+                    buffer_points,
+                    buffer_logL,
                 ),
             )
 

@@ -58,6 +58,7 @@ class NestedSampler:
         batch_sorting=True,
         history_correction=False,
         history_correction_iterations=1,
+        history_buffer_size=100,
         seed=42,
         dtype=tf.float32
     ):
@@ -86,6 +87,7 @@ class NestedSampler:
         self.batch_sorting = bool(batch_sorting)
         self.history_correction = bool(history_correction)
         self.history_correction_iterations = int(history_correction_iterations)
+        self.history_buffer_size = int(history_buffer_size)
         self.seed = tf.constant([seed, seed+1], dtype=tf.int32)
 
         # --------------------------------------------------
@@ -204,7 +206,8 @@ class NestedSampler:
             loglike=self.log_prob_fn_scaled,
             bounds=(self.scale_fn(self.lower), self.scale_fn(self.upper)),
             n_iter=self.slice_factor*self.ndim,
-            expand_to_worst=False,
+            expand_to_worst=self.history_correction,
+            buffer_size=self.history_buffer_size,
             global_mixing=self.slice_global_mixing,
         )
 
@@ -1493,7 +1496,7 @@ class NestedSampler:
                 )
             )
         def body(i, state):
-            state = self.run_iteration(state, replace_history=replace_history)
+            state = self.run_iteration(state, batch_sorting=batch_sorting, replace_history=replace_history)
             return i + 1, state
         i, new_state = tf.while_loop(
             cond,
@@ -1581,6 +1584,7 @@ class NestedSampler:
             batch_sorting=None,
             history_correction=None,
             history_correction_iterations=None,
+            history_buffer_size=None,
             seed=None,
     ):
         if seed is not None:
@@ -1621,12 +1625,16 @@ class NestedSampler:
         if history_correction is None:
             history_correction = self.history_correction
 
+        if history_buffer_size is None:
+            history_buffer_size = self.history_buffer_size
+
         if self.slice_sampler.expand_to_worst != history_correction:
             self.slice_sampler = slice_sampler(
                 loglike=self.log_prob_fn_scaled,
                 bounds=(self.scale_fn(self.lower), self.scale_fn(self.upper)),
                 n_iter=self.slice_factor*self.ndim,
                 expand_to_worst=history_correction,
+                buffer_size=history_buffer_size,
             )
 
         history_correction_tf = tf.logical_and(
