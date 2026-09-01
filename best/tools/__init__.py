@@ -1224,186 +1224,7 @@ class slice_sampler:
                     grow_b,
                 ),
             )
-            """
-            # -------------------------------------------------
-            # shrinkage
-            # -------------------------------------------------
 
-            accepted = tf.zeros(
-                (n_updates, 1),
-                dtype=dtype,
-            )
-
-            t_final = tf.zeros(
-                (n_updates, 1),
-                dtype=dtype,
-            )
-
-            def shrink_cond(
-                k,
-                a,
-                b,
-                accepted,
-                t_final,
-                buffer_points,
-                buffer_logL,
-            ):
-
-                return tf.logical_and(
-                    k < self.max_shrink,
-                    tf.reduce_sum(accepted)
-                    <
-                    tf.cast(n_updates, dtype),
-                )
-
-            def shrink_body(
-                k,
-                a,
-                b,
-                accepted,
-                t_final,
-                buffer_points,
-                buffer_logL,
-            ):
-
-                seed3 = seed + tf.stack([
-                    100000 * (i + 1) + k + 1,
-                    100000 * (k + 1) + i + 1
-                ])
-
-                t = tf.random.stateless_uniform(
-                    (n_updates, 1),
-                    minval=a,
-                    maxval=b,
-                    dtype=dtype,
-                    seed=seed3
-                )
-
-                x_t = x(t)
-
-                inside = inside_prior(x_t)
-
-                logL_t = self.loglike(x_t)
-
-                good = tf.cast(
-                    tf.logical_and(
-                        logL_t > worst_logLs,
-                        inside,
-                    ),
-                    dtype,
-                )[:, None]
-
-                new_accept = (
-                    (1.0 - accepted)
-                    *
-                    good
-                )
-
-                t_final = (
-                    (1.0 - new_accept)
-                    * t_final
-                    +
-                    new_accept
-                    * t
-                )
-
-                accepted = tf.maximum(
-                    accepted,
-                    good,
-                )
-
-                # -----------------------------------------
-                # only update intervals for chains
-                # not yet accepted
-                # -----------------------------------------
-
-                active = 1.0 - accepted
-
-                t_neg = tf.cast(
-                    t < 0.0,
-                    dtype,
-                )
-
-                t_pos = 1.0 - t_neg
-
-                bad = 1.0 - good
-
-                update_a = (
-                    active
-                    * bad
-                    * t_neg
-                )
-
-                update_b = (
-                    active
-                    * bad
-                    * t_pos
-                )
-
-                a = (
-                    (1.0 - update_a)
-                    * a
-                    +
-                    update_a
-                    * t
-                )
-
-                b = (
-                    (1.0 - update_b)
-                    * b
-                    +
-                    update_b
-                    * t
-                )
-
-                def save_shrink_history():
-                    # update buffer on index k mod buffer_size
-                    update_index = tf.math.floormod(k, self.buffer_size)
-                    new_points = x_t
-                    new_logL = logL_t
-                    buffer_points_new = tf.tensor_scatter_nd_update(
-                        buffer_points,
-                        tf.reshape(update_index, (1, 1)),
-                        tf.reshape(new_points, (1, n_updates, ndim))
-                    )
-                    buffer_logL_new = tf.tensor_scatter_nd_update(
-                        buffer_logL,
-                        tf.reshape(update_index, (1, 1)),
-                        tf.reshape(new_logL, (1, n_updates))
-                    )
-                    return buffer_points_new, buffer_logL_new
-
-
-                buffer_points, buffer_logL = tf.cond(
-                    tf.equal(i, self.n_iter-1),
-                    save_shrink_history,
-                    lambda: (buffer_points, buffer_logL)
-                )
-
-                return (
-                    k + 1,
-                    a,
-                    b,
-                    accepted,
-                    t_final,
-                    buffer_points,
-                    buffer_logL
-                )
-
-            _, _, _, _, t_final, buffer_points, buffer_logL = tf.while_loop(
-                shrink_cond,
-                shrink_body,
-                (
-                    tf.constant(0),
-                    a,
-                    b,
-                    accepted,
-                    t_final,
-                    buffer_points,
-                    buffer_logL
-                ),
-            )
-            """
             # -------------------------------------------------
             # shrinkage
             # -------------------------------------------------
@@ -1444,7 +1265,7 @@ class slice_sampler:
                 buffer_points,
                 buffer_logL,
             ):
-            
+
                 # -------------------------------------------------
                 # Which chains are active BEFORE this proposal?
                 #
@@ -1508,6 +1329,33 @@ class slice_sampler:
                 # -------------------------------------------------
             
                 def save_shrink_history():
+
+                    # -------------------------------------------------
+                    # Values that are allowed to participate in
+                    # history correction.
+                    #
+                    # Outside-prior points are genuine shrink proposals,
+                    # but they are NOT valid nested-sampling states.
+                    # Therefore mark their likelihood as the sentinel.
+                    # -------------------------------------------------
+
+                    history_logL_t = tf.where(
+                        inside,
+                        logL_t,
+                        tf.fill(
+                            tf.shape(logL_t),
+                            -dtype.max,
+                        ),
+                    )
+
+                    history_points_t = tf.where(
+                        inside[:, None],
+                        x_t,
+                        tf.fill(
+                            tf.shape(x_t),
+                            -dtype.max,
+                        ),
+                    )
             
                     # Drop the oldest history entry and append the
                     # current proposal on the right.
@@ -1521,7 +1369,7 @@ class slice_sampler:
                     shifted_points = tf.concat(
                         [
                             buffer_points[1:],
-                            x_t[None, :, :],
+                            history_points_t[None, :, :],
                         ],
                         axis=0,
                     )
@@ -1535,7 +1383,7 @@ class slice_sampler:
                     shifted_logL = tf.concat(
                         [
                             buffer_logL[1:],
-                            logL_t[None, :],
+                            history_logL_t[None, :],
                         ],
                         axis=0,
                     )
@@ -1640,8 +1488,7 @@ class slice_sampler:
                     update_b
                     * t
                 )
-            
-            
+
                 return (
                     k + 1,
                     a,

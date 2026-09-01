@@ -596,7 +596,6 @@ class NestedSampler:
         new_points, buffer_points, buffer_logLs = self.slice_sampler.sample(x0s, Ls, global_L, worst_logLs, seed=self.seed + tf.stack([iteration, iteration]))
         new_logLs = self.log_prob_fn_scaled(new_points)
 
-
         # -------------------------------------------------------------------------
         # Batch sorting
         # -------------------------------------------------------------------------
