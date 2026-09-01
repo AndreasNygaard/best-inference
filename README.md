@@ -142,12 +142,18 @@ nested_sampler = best.NestedSampler(
     n_live
     n_live_updates=10,
     n_max_iter=100000,
-    max_tree_depth=3,
+    max_tree_depth=0,
     min_cluster_size=50,
     cluster_merge_tolerance=0.30,
     cluster_update_interval=100,
     slice_factor=5,
     slice_step_size=5.0,
+    slice_global_mixing=0.1,
+    tolerance=1e-3,
+    batch_sorting=True,
+    history_correction=True,
+    history_correction_iterations=1,
+    history_buffer_size=100,
     seed=42,
     dtype=tf.float32
 )
@@ -203,7 +209,12 @@ results_ns = nested_sampler.run(
     update_interval=10,
     display_param_idx=0,
     output_width=None,
-    verbose=True
+    verbose=True,
+    batch_sorting=None,
+    history_correction=None,
+    history_correction_iterations=None,
+    history_buffer_size=None,
+    seed=None
 )
 ```
 
@@ -304,7 +315,7 @@ from best.client_emulators import load_model_and_scalers
 
 log_prob_fn, lower, upper = load_model_and_scalers("lcdm")
 
-nested_sampler = best.NestedSampler(log_prob_fn, bounds=(lower, upper), n_live=5000, n_live_updates=500)
+nested_sampler = best.NestedSampler(log_prob_fn, bounds=(lower, upper), n_live=1000, n_live_updates=100)
 
 # It takes a few minutes to compile. Run on GPU for faster results
 results = nested_sampler.run(update_interval=10)
@@ -398,7 +409,7 @@ When adding or recomputing points for a 2D profile likelihood, the colour scale 
 
 ## Nested sampling progress display
 
-When running the nested sampling sampler, a dynamic progress display is shown by default (disable with `verbose=False`). An example is shown below:
+When running the nested sampling sampler, a dynamic progress display is shown by default (disable with `verbose=False` with a faster sampling). An example is shown below:
 
 <img width="600" alt="nested" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/nested1.gif" />
 
@@ -442,6 +453,20 @@ If you use this package, please cite:
     archivePrefix = "arXiv",
     primaryClass = "astro-ph.IM",
     month = "6",
+    year = "2026"
+}
+```
+
+as well as this one (if using the nested sampler):
+
+```
+@article{Nygaard:2026hbr,
+    author = "Nygaard, Andreas",
+    title = "{Fast and efficient nested sampling with BEST}",
+    eprint = "2608.28514",
+    archivePrefix = "arXiv",
+    primaryClass = "astro-ph.IM",
+    month = "8",
     year = "2026"
 }
 ```
