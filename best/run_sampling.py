@@ -27,7 +27,16 @@ class SamplerResults():
         self.covmat_estimate = covmat_estimate
 
 class Sampler:
-    def __init__(self, log_prob_fn, bounds=None, enforce_boundaries=True, covmat=None, initial_state=None, n_chains=10, initial_distribution='repeat', boundary_penalty_factor=10000):
+    def __init__(self,
+                 log_prob_fn,
+                 bounds=None,
+                 enforce_boundaries=True,
+                 covmat=None,
+                 initial_state=None,
+                 n_chains=None,
+                 initial_distribution=None,
+                 boundary_penalty_factor=10000):
+
         self.log_prob_no_bounds = log_prob_fn
         if bounds is not None:
             self.lower_bounds = tf.convert_to_tensor(bounds[0], dtype=tf.float32)
@@ -37,8 +46,14 @@ class Sampler:
             self.upper_bounds = None
 
         self.initial_state = None
+        self.initial_distribution = None
+        self.n_chains = None
         if initial_state is not None:
-            self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=(lower_bounds, upper_bounds))
+            self.initial_state = tf.convert_to_tensor(initial_state, dtype=tf.float32)
+        if initial_distribution is not None:
+            self.initial_distribution = initial_distribution
+        if n_chains is not None:
+            self.n_chains = n_chains
             
         if enforce_boundaries and bounds is not None:
             self.log_prob_fn = self.create_bounded_log_prob_fn(self.log_prob_no_bounds, penalty_factor=boundary_penalty_factor)
@@ -57,8 +72,8 @@ class Sampler:
                initial_state=None,
                n_steps=100,
                method='aies',
-               n_chains=10,
-               initial_distribution='repeat',
+               n_chains=None,
+               initial_distribution=None,
                bounds=None,
                covmat=None,
                num_burnin_steps=100,
@@ -77,12 +92,57 @@ class Sampler:
         if (num_covmat_updates is None or num_covmat_updates > 0) and num_burnin_steps <= 0:
             raise ValueError("Burn-in steps must be greater than 0 if covariance matrix updates are requested.")
 
+        if bounds is not None:
+            if isinstance(bounds, list):
+                lower_bounds = tf.convert_to_tensor(bounds[0], dtype=tf.float32)
+                upper_bounds = tf.convert_to_tensor(bounds[1], dtype=tf.float32)
+            elif isinstance(bounds, tf.Tensor):
+                lower_bounds = bounds[0]
+                upper_bounds = bounds[1]
+            else:
+                raise ValueError("Bounds must be provided as a list or a Tensor.")
+            self.set_bounds(lower_bounds, upper_bounds, overwrite_covmat=False, overwrite_log_prob_fn=True)
+            bounds = (lower_bounds, upper_bounds)
+        elif self.lower_bounds is not None and self.upper_bounds is not None:
+            lower_bounds = self.lower_bounds
+            upper_bounds = self.upper_bounds
+            bounds = (lower_bounds, upper_bounds)
+        else:
+            bounds = None
+
+        if initial_state is not None:
+            initial_state = tf.convert_to_tensor(initial_state, dtype=tf.float32)
+        elif self.initial_state is not None:
+            initial_state = self.initial_state
+        else:
+            initial_state = None
+
+        if initial_distribution is not None:
+            initial_dist = initial_distribution
+        elif self.initial_distribution is not None:
+            initial_dist = self.initial_distribution
+        else:
+            initial_dist = 'repeat'
+
+        if n_chains is not None:
+            n_ch = n_chains
+        elif self.n_chains is not None:
+            n_ch = self.n_chains
+        else:
+            n_ch = 10
+
+
         if covmat is not None:
             covmat_estimate = self.format_covmat(covmat)
         else:
             covmat_estimate = self.ini_covmat
-        if initial_state is not None or initial_distribution == 'uniform':
-            self.set_initial_state(initial_state, n_chains=n_chains, initial_distribution=initial_distribution, bounds=bounds)
+        if initial_state is not None or initial_dist == 'uniform':
+            self.set_initial_state(initial_state,
+                                   n_chains=n_ch,
+                                   initial_distribution=initial_dist,
+                                   bounds=bounds,
+                                   covmat=covmat_estimate,
+                                   temperature=temperature)
         elif self.initial_state is None:
             raise ValueError("Initial state must be provided either during initialization, when calling sample(), or using the set_initial_state method.")
         n_chains = self.initial_state.shape[0]
@@ -141,8 +201,8 @@ class Sampler:
             if verbose:
                 print(f"Estimating covariance matrix, iteration {i+1}/{num_covmat_updates}...")
             samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, num_burnin_steps, covmat_estimate, burnin_sampler_kwargs)
-            combined_samples = tf.reshape(samples, [n_chains * num_burnin_steps, dim])
-            combined_loglkl = tf.reshape(loglkl, [n_chains * num_burnin_steps])
+            combined_samples = tf.reshape(samples, [n_ch * num_burnin_steps, dim])
+            combined_loglkl = tf.reshape(loglkl, [n_ch * num_burnin_steps])
             if get_individual_chains:
                 burnin_samples.append(samples)
                 burnin_loglkl.append(loglkl)
@@ -165,10 +225,10 @@ class Sampler:
                 self.initial_state = samples[-1,:,:] # set new initial_state to the last state of the previous iteration
             elif update_initial_state and (initial_state is None or len(initial_state.shape) == 1):
                 if update_initial_distribution:
-                    initial_distribution = 'gaussian'
+                    initial_dist = 'gaussian'
                 self.set_initial_state(bestfit_estimate,
-                                       n_chains=n_chains,
-                                       initial_distribution=initial_distribution,
+                                       n_chains=n_ch,
+                                       initial_distribution=initial_dist,
                                        bounds=bounds,
                                        covmat=covmat_estimate)
 
@@ -176,8 +236,8 @@ class Sampler:
             print("Running final sampling...")
         samples, loglkl, acceptance_rate, evaluations = sample_fn(self.initial_state, n_steps, covmat_estimate, sampler_kwargs)
         if not get_individual_chains:
-            samples = tf.reshape(samples, [n_chains * n_steps, dim])
-            loglkl = tf.reshape(loglkl, [n_chains * n_steps])
+            samples = tf.reshape(samples, [n_ch * n_steps, dim])
+            loglkl = tf.reshape(loglkl, [n_ch * n_steps])
 
         sampler_results = SamplerResults(samples, loglkl, acceptance_rate, evaluations)
         if num_covmat_updates > 0:
@@ -231,7 +291,15 @@ class Sampler:
         if overwrite_log_prob_fn:
             self.log_prob_fn = self.create_bounded_log_prob_fn(self.log_prob_no_bounds)
 
-    def set_initial_state(self, initial_state, n_chains=10, initial_distribution='repeat', bounds=None, covmat=None):
+    def set_initial_state(
+            self,
+            initial_state,
+            n_chains=10,
+            initial_distribution='repeat',
+            bounds=None,
+            covmat=None,
+            temperature=1.0
+    ):
         if isinstance(initial_state, list) and len(initial_state) > 2:
             initial_state = tf.convert_to_tensor(initial_state, dtype=tf.float32)
         elif isinstance(initial_state, np.ndarray) and len(initial_state.shape) > 2:
@@ -285,7 +353,7 @@ class Sampler:
                     covmat = self.ini_covmat
                 dist = HypersphereSampler(initial_state.shape[0],
                                           limits=bounds,
-                                          covmat=covmat.numpy(),
+                                          covmat=covmat.numpy()*(2*temperature)**2,
                                           centers=initial_state.numpy())
                 initial_state = tf.convert_to_tensor(dist.sample(n_chains), dtype=tf.float32)
             elif initial_distribution == 'uniform':

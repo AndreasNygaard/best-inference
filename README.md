@@ -121,8 +121,8 @@ sampler = best.Sampler(
     enforce_boundaries=True,
     covmat=None,
     initial_state=None,
-    n_chains=10,
-    initial_distribution="repeat",
+    n_chains=None,
+    initial_distribution=None,
     boundary_penalty_factor=10000
 )
 ```
@@ -179,7 +179,9 @@ results_samp = sampler.sample(
     burnin_kwargs={},
     get_individual_chains=True,
     jit_compile=True,
-    temperature=1.0
+    progress_bar=True,
+    temperature=1.0,
+    verbose=True
 )
 ```
 
@@ -273,7 +275,7 @@ log_prob_fn, lower_bounds, upper_bounds = load_model_and_scalers("lcdm")
 
 ### Example: emulator-based inference
 
-```
+```python
 import best
 from best.client_emulators import load_model_and_scalers
 
@@ -293,7 +295,7 @@ results = sampler.sample(
 
 ### Example: emulator-based profile likelihood
 
-```
+```python
 import best
 from best.client_emulators import load_model_and_scalers
 
@@ -309,7 +311,7 @@ results = optimiser.compute_profile(
 
 ### Example: emulator-based nested sampling
 
-```
+```python
 import best
 from best.client_emulators import load_model_and_scalers
 

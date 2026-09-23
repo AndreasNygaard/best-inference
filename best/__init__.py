@@ -16,3 +16,5 @@ __all__ = [
     "tools",
     "client_emulators"
 ]
+
+__version__ = "0.3.3"
