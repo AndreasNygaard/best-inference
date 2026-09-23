@@ -315,13 +315,13 @@ class Sampler:
         elif initial_state is None and initial_distribution == 'uniform':
             if bounds is not None:
                 lower_bounds, upper_bounds = bounds
-                if instance(lower_bounds, list):
+                if isinstance(lower_bounds, list):
                     lower_bounds = tf.convert_to_tensor(lower_bounds, dtype=tf.float32)
-                elif instance(lower_bounds, np.ndarray):
+                elif isinstance(lower_bounds, np.ndarray):
                     lower_bounds = tf.convert_to_tensor(lower_bounds, dtype=tf.float32)
-                if instance(upper_bounds, list):
+                if isinstance(upper_bounds, list):
                     upper_bounds = tf.convert_to_tensor(upper_bounds, dtype=tf.float32)
-                elif instance(upper_bounds, np.ndarray):
+                elif isinstance(upper_bounds, np.ndarray):
                     upper_bounds = tf.convert_to_tensor(upper_bounds, dtype=tf.float32)
             elif self.lower_bounds is not None and self.upper_bounds is not None:
                 lower_bounds = self.lower_bounds
@@ -337,7 +337,7 @@ class Sampler:
             elif initial_distribution == 'gaussian':
                 if bounds is not None:
                     if isinstance(bounds, list):
-                        if instance(bounds[0], tf.Tensor):
+                        if isinstance(bounds[0], tf.Tensor):
                             bounds = np.array([bounds[0].numpy(), bounds[1].numpy()]).T
                         else:
                             bounds = np.array(bounds).T
@@ -359,13 +359,13 @@ class Sampler:
             elif initial_distribution == 'uniform':
                 if bounds is not None:
                     lower_bounds, upper_bounds = bounds
-                    if instance(lower_bounds, list):
+                    if isinstance(lower_bounds, list):
                         lower_bounds = tf.convert_to_tensor(lower_bounds, dtype=tf.float32)
-                    elif instance(lower_bounds, np.ndarray):
+                    elif isinstance(lower_bounds, np.ndarray):
                         lower_bounds = tf.convert_to_tensor(lower_bounds, dtype=tf.float32)
-                    if instance(upper_bounds, list):
+                    if isinstance(upper_bounds, list):
                         upper_bounds = tf.convert_to_tensor(upper_bounds, dtype=tf.float32)
-                    elif instance(upper_bounds, np.ndarray):
+                    elif isinstance(upper_bounds, np.ndarray):
                         upper_bounds = tf.convert_to_tensor(upper_bounds, dtype=tf.float32)
                 elif self.lower_bounds is not None and self.upper_bounds is not None:
                     lower_bounds = self.lower_bounds
