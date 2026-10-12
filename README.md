@@ -411,7 +411,7 @@ When adding or recomputing points for a 2D profile likelihood, the colour scale 
 
 ## Nested sampling progress display
 
-When running the nested sampling sampler, a dynamic progress display is shown by default (disable with `verbose=False` with a faster sampling). An example is shown below:
+When running the nested sampling sampler, a dynamic progress display is shown by default (disable with `verbose=False` for a faster sampling). An example is shown below:
 
 <img width="600" alt="nested" src="https://raw.githubusercontent.com/AndreasNygaard/best-inference/main/assets/nested1.gif" />
 
