@@ -14,7 +14,7 @@ else:
 with tf.device(device):
     ns = NestedSampler(
         log_prob_fn,
-        (lower,upper)
+        (lower,upper),
         10000,
         n_live_updates=1000,
         n_max_iter=10000
