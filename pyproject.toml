@@ -14,7 +14,9 @@ dependencies = [
     "tensorflow>=2.16,<2.21",
     "tensorflow-probability>=0.23",
     "tf-keras>=2.16,<2.21",
-    "hypersphere-sampler"
+    "hypersphere-sampler",
+    "matplotlib",
+    "scipy"
 ]
 
 authors = [
